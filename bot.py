@@ -123,7 +123,7 @@ def handle_download(message):
             os.remove(filename)
 
     except Exception as e:
-        bot.reply_to(message, f"❌ Failed to download media: {str(e)}")
+        bot.reply_to(message, f"❌ Failed to download media,send link again immediately: {str(e)}")
 
 # Start keep-alive web server and bot polling
 keep_alive()

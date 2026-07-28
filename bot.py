@@ -39,7 +39,7 @@ CHANNEL_ID = "-1004478024359"
 # --- RAPIDAPI CREDENTIALS ---
 RAPIDAPI_KEY = "b421dd92a6mshcb73f4d602e7481p15d069jsn93478fd56f7b"
 PINTEREST_API_HOST = "pinterest-video-and-image-downloader.p.rapidapi.com"
-YOUTUBE_API_HOST = "youtube-info-download-api.p.rapidapi.com"
+YOUTUBE_API_HOST = "youtube-video-and-shorts-downloader.p.rapidapi.com"
 
 USER_FILE = "users.txt"
 
@@ -87,7 +87,7 @@ def save_user(chat_id):
     chat_id = str(chat_id)
     if not os.path.exists(USER_FILE):
         open(USER_FILE, "w").close()
-    
+        
     with open(USER_FILE, "r") as f:
         users = f.read().splitlines()
         
@@ -107,7 +107,7 @@ def get_all_users():
 def unshorten_url(url):
     """Expands short links like pin.it or youtu.be to full URLs cleanly."""
     try:
-        response = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=8)
+        response = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=30)
         return response.url
     except Exception:
         return url
@@ -200,7 +200,7 @@ def handle_download(message):
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             api_url = "https://www.tikwm.com/api/"
-            res = requests.get(api_url, params={'url': url}).json()
+            res = requests.get(api_url, params={'url': url}, timeout=30).json()
 
             if res.get("code") == 0 and "data" in res:
                 data = res["data"]
@@ -209,7 +209,7 @@ def handle_download(message):
                 if "images" in data and data["images"]:
                     bot.send_chat_action(message.chat.id, 'upload_photo')
                     for idx, img_url in enumerate(data["images"]):
-                        img_bytes = requests.get(img_url).content
+                        img_bytes = requests.get(img_url, timeout=30).content
                         img_path = f"downloads/tt_photo_{idx}.jpg"
                         with open(img_path, "wb") as f:
                             f.write(img_bytes)
@@ -224,7 +224,7 @@ def handle_download(message):
                 play_url = data["play"]
                 video_url = play_url if play_url.startswith("http") else "https://www.tikwm.com" + play_url
                 
-                video_bytes = requests.get(video_url).content
+                video_bytes = requests.get(video_url, timeout=30).content
                 file_path = "downloads/tiktok_no_watermark.mp4"
                 
                 with open(file_path, "wb") as f:
@@ -251,7 +251,7 @@ def handle_download(message):
                 "x-rapidapi-key": RAPIDAPI_KEY
             }
             
-            response = requests.get(api_endpoint, headers=api_headers, params={"url": url}, timeout=12)
+            response = requests.get(api_endpoint, headers=api_headers, params={"url": url}, timeout=30)
             data = response.json()
             
             print(f"[PINTEREST API LOG] Response: {data}")
@@ -272,7 +272,7 @@ def handle_download(message):
                 
                 if is_video:
                     bot.send_chat_action(message.chat.id, 'upload_video')
-                    v_bytes = requests.get(media_url, timeout=20).content
+                    v_bytes = requests.get(media_url, timeout=30).content
                     f_path = "downloads/pin_video.mp4"
                     with open(f_path, "wb") as f:
                         f.write(v_bytes)
@@ -283,7 +283,7 @@ def handle_download(message):
                     return
                 else:
                     bot.send_chat_action(message.chat.id, 'upload_photo')
-                    i_bytes = requests.get(media_url, timeout=20).content
+                    i_bytes = requests.get(media_url, timeout=30).content
                     f_path = "downloads/pin_photo.jpg"
                     with open(f_path, "wb") as f:
                         f.write(i_bytes)
@@ -301,17 +301,16 @@ def handle_download(message):
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             
-            yt_endpoint = "https://youtube-info-download-api.p.rapidapi.com/ajax/download.php"
+            yt_endpoint = "https://youtube-video-and-shorts-downloader.p.rapidapi.com/"
             yt_headers = {
                 "x-rapidapi-host": YOUTUBE_API_HOST,
                 "x-rapidapi-key": RAPIDAPI_KEY
             }
             yt_params = {
-                "url": url,
-                "format": "720"
+                "url": url
             }
             
-            response = requests.get(yt_endpoint, headers=yt_headers, params=yt_params, timeout=20)
+            response = requests.get(yt_endpoint, headers=yt_headers, params=yt_params, timeout=30)
             yt_data = response.json()
             print(f"[YOUTUBE API LOG] Response: {yt_data}")
 
@@ -321,7 +320,9 @@ def handle_download(message):
                     yt_data.get("download_url") or 
                     yt_data.get("url") or 
                     yt_data.get("link") or 
-                    yt_data.get("media")
+                    yt_data.get("media") or
+                    yt_data.get("video") or
+                    yt_data.get("videoUrl")
                 )
                 if not yt_media_url and "links" in yt_data:
                     links = yt_data["links"]
@@ -336,6 +337,14 @@ def handle_download(message):
                                 break
                     elif isinstance(links, list) and len(links) > 0:
                         yt_media_url = links[0].get("url") if isinstance(links[0], dict) else links[0]
+                        
+                if not yt_media_url and "formats" in yt_data:
+                    formats = yt_data["formats"]
+                    if isinstance(formats, list) and len(formats) > 0:
+                        for f in formats:
+                            if isinstance(f, dict) and (f.get("url") or f.get("link")):
+                                yt_media_url = f.get("url") or f.get("link")
+                                break
 
             if yt_media_url and str(yt_media_url).startswith("http"):
                 v_bytes = requests.get(yt_media_url, timeout=30).content

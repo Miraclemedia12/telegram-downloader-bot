@@ -30,15 +30,78 @@ def keep_alive():
 BOT_TOKEN = "8651304992:AAEELcBPCEHNSiy8shrSzRoHb-IebEoiYfg"
 BOT_CAPTION = "Downloaded via @Mediagrab001_Bot"
 
-# --- RAPIDAPI PINTEREST CREDENTIALS (FROM YOUR SCREENSHOT) ---
+# 🔑 YOUR NUMERIC TELEGRAM USER ID
+ADMIN_ID = "5917904582"
+
+# 📢 YOUR PRIVATE TELEGRAM DATABASE CHANNEL ID
+CHANNEL_ID = "-1004478024359"
+
+# --- RAPIDAPI PINTEREST CREDENTIALS ---
 RAPIDAPI_KEY = "b421dd92a6mshcb73f4d602e7481p15d069jsn93478fd56f7b"
 RAPIDAPI_HOST = "pinterest-video-and-image-downloader.p.rapidapi.com"
+
+USER_FILE = "users.txt"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
 }
+
+# --- TELEGRAM CHANNEL CLOUD STORAGE SYNC ---
+def sync_from_telegram():
+    """Restores users.txt from the pinned file in your Private Telegram Channel upon server start/restart."""
+    if not CHANNEL_ID or CHANNEL_ID == "YOUR_CHANNEL_ID_HERE":
+        print("⚠️ Channel ID not configured. Skipping cloud database restore.")
+        return
+
+    try:
+        chat = bot.get_chat(CHANNEL_ID)
+        if chat.pinned_message and chat.pinned_message.document:
+            file_info = bot.get_file(chat.pinned_message.document.file_id)
+            downloaded_file = bot.download_file(file_info.file_path)
+            with open(USER_FILE, 'wb') as f:
+                f.write(downloaded_file)
+            print("✅ Successfully restored user database from Telegram Channel!")
+    except Exception as e:
+        print(f"Cloud DB restore log: {e}")
+
+def sync_to_telegram():
+    """Uploads updated users.txt database to your Private Channel and pins it."""
+    if not CHANNEL_ID or CHANNEL_ID == "YOUR_CHANNEL_ID_HERE":
+        return
+
+    try:
+        if os.path.exists(USER_FILE):
+            with open(USER_FILE, 'rb') as doc:
+                msg = bot.send_document(CHANNEL_ID, doc, caption="📦 Lifetime User Database Backup")
+            bot.pin_chat_message(CHANNEL_ID, msg.message_id)
+            print("☁️ Database backed up to Telegram Channel!")
+    except Exception as e:
+        print(f"Cloud DB backup error: {e}")
+
+# --- HELPER FUNCTIONS FOR USER STORAGE ---
+def save_user(chat_id):
+    """Saves new user chat IDs automatically and syncs to cloud storage."""
+    chat_id = str(chat_id)
+    if not os.path.exists(USER_FILE):
+        open(USER_FILE, "w").close()
+    
+    with open(USER_FILE, "r") as f:
+        users = f.read().splitlines()
+        
+    if chat_id not in users:
+        with open(USER_FILE, "a") as f:
+            f.write(f"{chat_id}\n")
+        # Back up to Telegram channel in the background
+        Thread(target=sync_to_telegram).start()
+
+def get_all_users():
+    """Retrieves all saved user IDs."""
+    if not os.path.exists(USER_FILE):
+        return []
+    with open(USER_FILE, "r") as f:
+        return f.read().splitlines()
 
 def unshorten_url(url):
     """Expands short links like pin.it to full URLs cleanly."""
@@ -48,8 +111,11 @@ def unshorten_url(url):
     except Exception:
         return url
 
+# --- COMMAND HANDLERS ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
+    save_user(message.chat.id)
+    
     welcome_text = (
         "⚡ Welcome to your Ultimate Downloader!\n\n"
         "Send me any link from:\n"
@@ -62,8 +128,61 @@ def send_welcome(message):
     )
     bot.reply_to(message, welcome_text, parse_mode="HTML")
 
+# --- ADMIN BROADCAST COMMAND ---
+@bot.message_handler(commands=['broadcast'])
+def broadcast_message(message):
+    save_user(message.chat.id)
+    
+    # Check if the sender is authorized
+    if str(message.from_user.id) != str(ADMIN_ID):
+        bot.reply_to(message, "⛔ You are not authorized to use this admin command!")
+        return
+
+    # Get the text after the /broadcast command
+    command_args = message.text.split(maxsplit=1)
+    if len(command_args) < 2:
+        bot.reply_to(
+            message, 
+            "⚠️ <b>Please include a message to broadcast.</b>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/broadcast 🚀 Great news! You can now download photos & videos directly from Pinterest! Send us any pin.it link now.</code>", 
+            parse_mode="HTML"
+        )
+        return
+
+    announcement = command_args[1]
+    users = get_all_users()
+    
+    if not users:
+        bot.reply_to(message, "⚠️ No registered users found in the database yet.")
+        return
+
+    bot.reply_to(message, f"📢 Starting broadcast to {len(users)} bot user(s)...")
+    
+    success_count = 0
+    fail_count = 0
+
+    for user_id in users:
+        try:
+            bot.send_message(user_id, announcement, parse_mode="HTML")
+            success_count += 1
+        except Exception:
+            # User might have blocked or deleted the chat with the bot
+            fail_count += 1
+
+    bot.send_message(
+        message.chat.id, 
+        f"✅ <b>Broadcast Completed!</b>\n\n"
+        f"• Successfully sent: <b>{success_count}</b>\n"
+        f"• Failed/Blocked: <b>{fail_count}</b>",
+        parse_mode="HTML"
+    )
+
+# --- MEDIA DOWNLOAD HANDLER ---
 @bot.message_handler(func=lambda message: True)
 def handle_download(message):
+    save_user(message.chat.id)
+    
     raw_url = message.text.strip()
     
     if not raw_url.startswith("http"):
@@ -134,10 +253,8 @@ def handle_download(message):
             response = requests.get(api_endpoint, headers=api_headers, params={"url": url}, timeout=12)
             data = response.json()
             
-            # Print response to Render logs for debugging
             print(f"[PINTEREST API LOG] Response: {data}")
 
-            # Smart extractor for different JSON structures returned by this API
             media_url = None
             if isinstance(data, dict):
                 media_url = data.get("url") or data.get("download_url") or data.get("media") or data.get("result")
@@ -221,7 +338,11 @@ def handle_download(message):
             parse_mode="HTML"
         )
 
-# Start keep-alive web server and bot polling
+# --- STARTUP SYNC & BOT POLLING ---
 keep_alive()
+
+# Restore user database from Telegram Channel before starting bot
+sync_from_telegram()
+
 print("⚡ Professional Downloader Bot is live! Press Ctrl+C to stop.")
 bot.infinity_polling()

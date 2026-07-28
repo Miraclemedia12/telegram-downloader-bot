@@ -5,6 +5,12 @@ import yt_dlp
 from flask import Flask
 from threading import Thread
 
+# --- COOKIE ENVIRONMENT CHECK ---
+# Automatically creates cookies.txt if YOUTUBE_COOKIES is added to Render Env Variables
+if os.environ.get("YOUTUBE_COOKIES"):
+    with open("cookies.txt", "w") as f:
+        f.write(os.environ.get("YOUTUBE_COOKIES"))
+
 # --- KEEP ALIVE WEB SERVER (For 24/7 Cloud Hosting) ---
 app = Flask('')
 
@@ -22,6 +28,8 @@ def keep_alive():
 
 # --- TELEGRAM BOT LOGIC ---
 BOT_TOKEN = "8651304992:AAEELcBPCEHNSiy8shrSzRoHb-IebEoiYfg"
+BOT_CAPTION = "Downloaded via @Mediagrab001_Bot"
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
 @bot.message_handler(commands=['start'])
@@ -59,6 +67,7 @@ def handle_download(message):
             if res.get("code") == 0 and "data" in res:
                 data = res["data"]
                 
+                # Handle TikTok photo slideshows
                 if "images" in data and data["images"]:
                     bot.send_chat_action(message.chat.id, 'upload_photo')
                     for idx, img_url in enumerate(data["images"]):
@@ -67,11 +76,13 @@ def handle_download(message):
                         with open(img_path, "wb") as f:
                             f.write(img_bytes)
                         with open(img_path, "rb") as photo:
-                            bot.send_photo(message.chat.id, photo)
+                            cap = BOT_CAPTION if idx == 0 else None
+                            bot.send_photo(message.chat.id, photo, caption=cap)
                         if os.path.exists(img_path):
                             os.remove(img_path)
                     return
 
+                # Handle TikTok videos
                 play_url = data["play"]
                 video_url = play_url if play_url.startswith("http") else "https://www.tikwm.com" + play_url
                 
@@ -83,7 +94,7 @@ def handle_download(message):
                     f.write(video_bytes)
 
                 with open(file_path, "rb") as video:
-                    bot.send_video(message.chat.id, video, caption="✨ Downloaded without watermark!", parse_mode="HTML")
+                    bot.send_video(message.chat.id, video, caption=BOT_CAPTION, parse_mode="HTML")
 
                 if os.path.exists(file_path):
                     os.remove(file_path)
@@ -92,7 +103,7 @@ def handle_download(message):
         except Exception as err:
             print("TikWM API error, trying yt-dlp fallback:", err)
 
-    # --- FALLBACK FOR OTHER PLATFORMS ---
+    # --- FALLBACK FOR OTHER PLATFORMS (YOUTUBE, INSTAGRAM, X, ETC) ---
     bot.send_chat_action(message.chat.id, 'upload_video')
 
     ydl_opts = {
@@ -100,10 +111,15 @@ def handle_download(message):
         'outtmpl': 'downloads/%(id)s.%(ext)s',
         'max_filesize': 50 * 1024 * 1024,
         'nocheckcertificate': True,
+        'quiet': True,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         }
     }
+
+    # Pass cookies if file exists
+    if os.path.exists('cookies.txt'):
+        ydl_opts['cookiefile'] = 'cookies.txt'
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -113,17 +129,27 @@ def handle_download(message):
         if filename.endswith(('.jpg', '.jpeg', '.png', '.webp')):
             bot.send_chat_action(message.chat.id, 'upload_photo')
             with open(filename, 'rb') as photo:
-                bot.send_photo(message.chat.id, photo)
+                bot.send_photo(message.chat.id, photo, caption=BOT_CAPTION)
         else:
             bot.send_chat_action(message.chat.id, 'upload_video')
             with open(filename, 'rb') as video:
-                bot.send_video(message.chat.id, video)
+                bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
 
         if os.path.exists(filename):
             os.remove(filename)
 
     except Exception as e:
-        bot.reply_to(message, f"❌ Failed to download media,send link again immediately: {str(e)}")
+        # Internal log for Render debugging
+        print(f"[SERVER LOG] Download failed for {url}: {str(e)}")
+        
+        # Professional message shown to user
+        bot.reply_to(
+            message,
+            "⚠️ <b>Unable to download this video right now.</b>\n\n"
+            "This link may be private, age-restricted, or exceeds Telegram's 50MB file size limit. "
+            "Please check the link and try again!",
+            parse_mode="HTML"
+        )
 
 # Start keep-alive web server and bot polling
 keep_alive()

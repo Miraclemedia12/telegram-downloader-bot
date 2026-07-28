@@ -7,7 +7,6 @@ from flask import Flask
 from threading import Thread
 
 # --- COOKIE ENVIRONMENT CHECK ---
-# Automatically creates cookies.txt if YOUTUBE_COOKIES is added to Render Env Variables
 if os.environ.get("YOUTUBE_COOKIES"):
     with open("cookies.txt", "w") as f:
         f.write(os.environ.get("YOUTUBE_COOKIES"))
@@ -31,12 +30,20 @@ def keep_alive():
 BOT_TOKEN = "8651304992:AAEELcBPCEHNSiy8shrSzRoHb-IebEoiYfg"
 BOT_CAPTION = "Downloaded via @Mediagrab001_Bot"
 
+# --- RAPIDAPI PINTEREST CREDENTIALS (FROM YOUR SCREENSHOT) ---
+RAPIDAPI_KEY = "b421dd92a6mshcb73f4d602e7481p15d069jsn93478fd56f7b"
+RAPIDAPI_HOST = "pinterest-video-and-image-downloader.p.rapidapi.com"
+
 bot = telebot.TeleBot(BOT_TOKEN)
 
+HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+}
+
 def unshorten_url(url):
-    """Expands short links like pin.it to full URLs so extractors can process them."""
+    """Expands short links like pin.it to full URLs cleanly."""
     try:
-        response = requests.head(url, allow_redirects=True, timeout=5)
+        response = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=8)
         return response.url
     except Exception:
         return url
@@ -63,10 +70,7 @@ def handle_download(message):
         bot.reply_to(message, "⚠️ Please send a valid social media link!")
         return
 
-    # Unshorten links like pin.it before proceeding
     url = unshorten_url(raw_url)
-
-    bot.send_chat_action(message.chat.id, 'upload_video')
 
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
@@ -74,6 +78,7 @@ def handle_download(message):
     # --- TIKTOK NO-WATERMARK ---
     if "tiktok.com" in url:
         try:
+            bot.send_chat_action(message.chat.id, 'upload_video')
             api_url = "https://www.tikwm.com/api/"
             res = requests.get(api_url, params={'url': url}).json()
 
@@ -99,7 +104,6 @@ def handle_download(message):
                 play_url = data["play"]
                 video_url = play_url if play_url.startswith("http") else "https://www.tikwm.com" + play_url
                 
-                bot.send_chat_action(message.chat.id, 'upload_video')
                 video_bytes = requests.get(video_url).content
                 file_path = "downloads/tiktok_no_watermark.mp4"
                 
@@ -116,58 +120,63 @@ def handle_download(message):
         except Exception as err:
             print("TikWM API error, trying yt-dlp fallback:", err)
 
-    # --- DEDICATED PINTEREST DIRECT PARSER (PHOTOS & VIDEOS) ---
+    # --- RAPIDAPI PINTEREST ENGINE ---
     if "pinterest.com" in url or "pin.it" in url:
         try:
-            session = requests.Session()
-            session.headers.update({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-            })
-            resp = session.get(url, allow_redirects=True, timeout=10)
-            html = resp.text
+            bot.send_chat_action(message.chat.id, 'upload_photo')
+            
+            api_endpoint = "https://pinterest-video-and-image-downloader.p.rapidapi.com/pinterest"
+            api_headers = {
+                "x-rapidapi-host": RAPIDAPI_HOST,
+                "x-rapidapi-key": RAPIDAPI_KEY
+            }
+            
+            response = requests.get(api_endpoint, headers=api_headers, params={"url": url}, timeout=12)
+            data = response.json()
+            
+            # Print response to Render logs for debugging
+            print(f"[PINTEREST API LOG] Response: {data}")
 
-            # 1. Check if Pinterest Video
-            video_match = re.search(r'<meta property="og:video(?::secure_url)?" content="([^"]+)"', html) or re.search(r'"contentUrl":"([^"]+\.mp4)"', html)
-            if video_match:
-                video_src = video_match.group(1).replace('\\/', '/')
-                bot.send_chat_action(message.chat.id, 'upload_video')
-                v_bytes = session.get(video_src, timeout=15).content
-                f_path = "downloads/pinterest_video.mp4"
-                with open(f_path, "wb") as f:
-                    f.write(v_bytes)
-                with open(f_path, "rb") as video:
-                    bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
-                if os.path.exists(f_path):
-                    os.remove(f_path)
-                return
+            # Smart extractor for different JSON structures returned by this API
+            media_url = None
+            if isinstance(data, dict):
+                media_url = data.get("url") or data.get("download_url") or data.get("media") or data.get("result")
+                if not media_url and "data" in data:
+                    if isinstance(data["data"], dict):
+                        media_url = data["data"].get("url") or data["data"].get("download_url") or data["data"].get("image") or data["data"].get("video")
+                    elif isinstance(data["data"], str):
+                        media_url = data["data"]
+                    elif isinstance(data["data"], list) and len(data["data"]) > 0:
+                        media_url = data["data"][0].get("url") if isinstance(data["data"][0], dict) else data["data"][0]
 
-            # 2. Check if Pinterest Photo
-            img_match = re.search(r'<meta property="og:image" content="([^"]+)"', html)
-            if img_match:
-                img_src = img_match.group(1)
-                # Upgrade to highest quality original resolution image
-                high_res_src = re.sub(r'/[0-9]+x/', '/originals/', img_src)
+            if media_url:
+                is_video = ".mp4" in media_url.lower() or (isinstance(data, dict) and data.get("type") == "video")
                 
-                # Check if high-res image link is active
-                try:
-                    test_res = session.head(high_res_src, timeout=5)
-                    final_img_url = high_res_src if test_res.status_code == 200 else img_src
-                except Exception:
-                    final_img_url = img_src
-
-                bot.send_chat_action(message.chat.id, 'upload_photo')
-                i_bytes = session.get(final_img_url, timeout=15).content
-                f_path = "downloads/pinterest_img.jpg"
-                with open(f_path, "wb") as f:
-                    f.write(i_bytes)
-                with open(f_path, "rb") as photo:
-                    bot.send_photo(message.chat.id, photo, caption=BOT_CAPTION)
-                if os.path.exists(f_path):
-                    os.remove(f_path)
-                return
+                if is_video:
+                    bot.send_chat_action(message.chat.id, 'upload_video')
+                    v_bytes = requests.get(media_url, timeout=20).content
+                    f_path = "downloads/pin_video.mp4"
+                    with open(f_path, "wb") as f:
+                        f.write(v_bytes)
+                    with open(f_path, "rb") as video:
+                        bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
+                    if os.path.exists(f_path):
+                        os.remove(f_path)
+                    return
+                else:
+                    bot.send_chat_action(message.chat.id, 'upload_photo')
+                    i_bytes = requests.get(media_url, timeout=20).content
+                    f_path = "downloads/pin_photo.jpg"
+                    with open(f_path, "wb") as f:
+                        f.write(i_bytes)
+                    with open(f_path, "rb") as photo:
+                        bot.send_photo(message.chat.id, photo, caption=BOT_CAPTION)
+                    if os.path.exists(f_path):
+                        os.remove(f_path)
+                    return
 
         except Exception as p_err:
-            print("Pinterest direct parser error, falling back to yt-dlp:", p_err)
+            print("[PINTEREST ERROR] RapidAPI call failed:", p_err)
 
     # --- FALLBACK FOR OTHER PLATFORMS (YOUTUBE, INSTAGRAM, X, ETC) ---
     bot.send_chat_action(message.chat.id, 'upload_video')
@@ -178,12 +187,9 @@ def handle_download(message):
         'max_filesize': 50 * 1024 * 1024,
         'nocheckcertificate': True,
         'quiet': True,
-        'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-        }
+        'http_headers': HEADERS
     }
 
-    # Pass cookies if file exists
     if os.path.exists('cookies.txt'):
         ydl_opts['cookiefile'] = 'cookies.txt'
 
@@ -205,10 +211,8 @@ def handle_download(message):
             os.remove(filename)
 
     except Exception as e:
-        # Internal log for Render debugging
         print(f"[SERVER LOG] Download failed for {url}: {str(e)}")
         
-        # Professional message shown to user
         bot.reply_to(
             message,
             "⚠️ <b>Unable to download this media right now.</b>\n\n"

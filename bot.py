@@ -32,6 +32,14 @@ BOT_CAPTION = "Downloaded via @Mediagrab001_Bot"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
+def unshorten_url(url):
+    """Expands short links like pin.it to full URLs so yt-dlp can process them."""
+    try:
+        response = requests.head(url, allow_redirects=True, timeout=5)
+        return response.url
+    except Exception:
+        return url
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
     welcome_text = (
@@ -40,6 +48,7 @@ def send_welcome(message):
         "• TikTok (No Watermark videos & photo slideshows)\n"
         "• Instagram (Reels & Photos)\n"
         "• YouTube (Shorts & Videos)\n"
+        "• Pinterest (Videos & High-Res Photos)\n"
         "• Snapchat & X (Twitter)\n\n"
         "Just paste your link below to start! 🚀"
     )
@@ -47,11 +56,14 @@ def send_welcome(message):
 
 @bot.message_handler(func=lambda message: True)
 def handle_download(message):
-    url = message.text.strip()
+    raw_url = message.text.strip()
     
-    if not url.startswith("http"):
+    if not raw_url.startswith("http"):
         bot.reply_to(message, "⚠️ Please send a valid social media link!")
         return
+
+    # Unshorten links like pin.it before proceeding
+    url = unshorten_url(raw_url)
 
     bot.send_chat_action(message.chat.id, 'upload_video')
 
@@ -59,7 +71,7 @@ def handle_download(message):
         os.makedirs('downloads')
 
     # --- TIKTOK NO-WATERMARK ---
-    if "tiktok.com" in url or "vt.tiktok.com" in url or "vm.tiktok.com" in url:
+    if "tiktok.com" in url:
         try:
             api_url = "https://www.tikwm.com/api/"
             res = requests.get(api_url, params={'url': url}).json()
@@ -103,7 +115,7 @@ def handle_download(message):
         except Exception as err:
             print("TikWM API error, trying yt-dlp fallback:", err)
 
-    # --- FALLBACK FOR OTHER PLATFORMS (YOUTUBE, INSTAGRAM, X, ETC) ---
+    # --- FALLBACK FOR OTHER PLATFORMS (PINTEREST, YOUTUBE, INSTAGRAM, X, ETC) ---
     bot.send_chat_action(message.chat.id, 'upload_video')
 
     ydl_opts = {
@@ -145,7 +157,7 @@ def handle_download(message):
         # Professional message shown to user
         bot.reply_to(
             message,
-            "⚠️ <b>Unable to download this video right now.</b>\n\n"
+            "⚠️ <b>Unable to download this media right now.</b>\n\n"
             "This link may be private, age-restricted, or exceeds Telegram's 50MB file size limit. "
             "Please check the link and try again!",
             parse_mode="HTML"

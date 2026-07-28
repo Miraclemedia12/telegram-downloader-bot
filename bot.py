@@ -27,7 +27,7 @@ def keep_alive():
     t.start()
 
 # --- TELEGRAM BOT LOGIC ---
-BOT_TOKEN = "8651304992:AAEELcBPCEHNSiy8shrSzRoHb-IebEoiYfg"
+BOT_TOKEN = "8651304992:AAGYe5xn993XkWdmMbNyQlJWX2ewYe_OvdM"
 BOT_CAPTION = "Downloaded via @Mediagrab001_Bot"
 
 # 🔑 YOUR NUMERIC TELEGRAM USER ID

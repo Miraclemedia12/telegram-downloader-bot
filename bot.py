@@ -1,4 +1,5 @@
 import os
+import re
 import requests
 import telebot
 import yt_dlp
@@ -33,7 +34,7 @@ BOT_CAPTION = "Downloaded via @Mediagrab001_Bot"
 bot = telebot.TeleBot(BOT_TOKEN)
 
 def unshorten_url(url):
-    """Expands short links like pin.it to full URLs so yt-dlp can process them."""
+    """Expands short links like pin.it to full URLs so extractors can process them."""
     try:
         response = requests.head(url, allow_redirects=True, timeout=5)
         return response.url
@@ -115,7 +116,60 @@ def handle_download(message):
         except Exception as err:
             print("TikWM API error, trying yt-dlp fallback:", err)
 
-    # --- FALLBACK FOR OTHER PLATFORMS (PINTEREST, YOUTUBE, INSTAGRAM, X, ETC) ---
+    # --- DEDICATED PINTEREST DIRECT PARSER (PHOTOS & VIDEOS) ---
+    if "pinterest.com" in url or "pin.it" in url:
+        try:
+            session = requests.Session()
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            })
+            resp = session.get(url, allow_redirects=True, timeout=10)
+            html = resp.text
+
+            # 1. Check if Pinterest Video
+            video_match = re.search(r'<meta property="og:video(?::secure_url)?" content="([^"]+)"', html) or re.search(r'"contentUrl":"([^"]+\.mp4)"', html)
+            if video_match:
+                video_src = video_match.group(1).replace('\\/', '/')
+                bot.send_chat_action(message.chat.id, 'upload_video')
+                v_bytes = session.get(video_src, timeout=15).content
+                f_path = "downloads/pinterest_video.mp4"
+                with open(f_path, "wb") as f:
+                    f.write(v_bytes)
+                with open(f_path, "rb") as video:
+                    bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
+                if os.path.exists(f_path):
+                    os.remove(f_path)
+                return
+
+            # 2. Check if Pinterest Photo
+            img_match = re.search(r'<meta property="og:image" content="([^"]+)"', html)
+            if img_match:
+                img_src = img_match.group(1)
+                # Upgrade to highest quality original resolution image
+                high_res_src = re.sub(r'/[0-9]+x/', '/originals/', img_src)
+                
+                # Check if high-res image link is active
+                try:
+                    test_res = session.head(high_res_src, timeout=5)
+                    final_img_url = high_res_src if test_res.status_code == 200 else img_src
+                except Exception:
+                    final_img_url = img_src
+
+                bot.send_chat_action(message.chat.id, 'upload_photo')
+                i_bytes = session.get(final_img_url, timeout=15).content
+                f_path = "downloads/pinterest_img.jpg"
+                with open(f_path, "wb") as f:
+                    f.write(i_bytes)
+                with open(f_path, "rb") as photo:
+                    bot.send_photo(message.chat.id, photo, caption=BOT_CAPTION)
+                if os.path.exists(f_path):
+                    os.remove(f_path)
+                return
+
+        except Exception as p_err:
+            print("Pinterest direct parser error, falling back to yt-dlp:", p_err)
+
+    # --- FALLBACK FOR OTHER PLATFORMS (YOUTUBE, INSTAGRAM, X, ETC) ---
     bot.send_chat_action(message.chat.id, 'upload_video')
 
     ydl_opts = {

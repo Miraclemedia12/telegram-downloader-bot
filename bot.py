@@ -36,9 +36,10 @@ ADMIN_ID = "5917904582"
 # 📢 YOUR PRIVATE TELEGRAM DATABASE CHANNEL ID
 CHANNEL_ID = "-1004478024359"
 
-# --- RAPIDAPI PINTEREST CREDENTIALS ---
+# --- RAPIDAPI CREDENTIALS ---
 RAPIDAPI_KEY = "b421dd92a6mshcb73f4d602e7481p15d069jsn93478fd56f7b"
-RAPIDAPI_HOST = "pinterest-video-and-image-downloader.p.rapidapi.com"
+PINTEREST_API_HOST = "pinterest-video-and-image-downloader.p.rapidapi.com"
+YOUTUBE_API_HOST = "youtube-info-download-api.p.rapidapi.com"
 
 USER_FILE = "users.txt"
 
@@ -104,7 +105,7 @@ def get_all_users():
         return f.read().splitlines()
 
 def unshorten_url(url):
-    """Expands short links like pin.it to full URLs cleanly."""
+    """Expands short links like pin.it or youtu.be to full URLs cleanly."""
     try:
         response = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=8)
         return response.url
@@ -121,7 +122,7 @@ def send_welcome(message):
         "Send me any link from:\n"
         "• TikTok (No Watermark videos & photo slideshows)\n"
         "• Instagram (Reels & Photos)\n"
-        "• YouTube (Shorts & Videos)\n"
+        "• YouTube (Shorts, Long Videos & Music)\n"
         "• Pinterest (Videos & High-Res Photos)\n"
         "• Snapchat & X (Twitter)\n\n"
         "Just paste your link below to start! 🚀"
@@ -145,7 +146,7 @@ def broadcast_message(message):
             message, 
             "⚠️ <b>Please include a message to broadcast.</b>\n\n"
             "<b>Example:</b>\n"
-            "<code>/broadcast 🚀 Great news! You can now download photos & videos directly from Pinterest! Send us any pin.it link now.</code>", 
+            "<code>/broadcast 🚀 Great news! YouTube downloads (Shorts, Videos, Music) are fully restored! Try pasting any YouTube link now.</code>", 
             parse_mode="HTML"
         )
         return
@@ -246,7 +247,7 @@ def handle_download(message):
             
             api_endpoint = "https://pinterest-video-and-image-downloader.p.rapidapi.com/pinterest"
             api_headers = {
-                "x-rapidapi-host": RAPIDAPI_HOST,
+                "x-rapidapi-host": PINTEREST_API_HOST,
                 "x-rapidapi-key": RAPIDAPI_KEY
             }
             
@@ -295,7 +296,76 @@ def handle_download(message):
         except Exception as p_err:
             print("[PINTEREST ERROR] RapidAPI call failed:", p_err)
 
-    # --- FALLBACK FOR OTHER PLATFORMS (YOUTUBE, INSTAGRAM, X, ETC) ---
+    # --- RAPIDAPI YOUTUBE ENGINE (SHORTS, LONG VIDEOS & MUSIC) ---
+    if "youtube.com" in url or "youtu.be" in url or "music.youtube.com" in url:
+        try:
+            bot.send_chat_action(message.chat.id, 'upload_video')
+            
+            yt_endpoint = "https://youtube-info-download-api.p.rapidapi.com/ajax/download.php"
+            yt_headers = {
+                "x-rapidapi-host": YOUTUBE_API_HOST,
+                "x-rapidapi-key": RAPIDAPI_KEY
+            }
+            yt_params = {
+                "url": url,
+                "format": "720"
+            }
+            
+            response = requests.get(yt_endpoint, headers=yt_headers, params=yt_params, timeout=20)
+            yt_data = response.json()
+            print(f"[YOUTUBE API LOG] Response: {yt_data}")
+
+            yt_media_url = None
+            if isinstance(yt_data, dict):
+                yt_media_url = (
+                    yt_data.get("download_url") or 
+                    yt_data.get("url") or 
+                    yt_data.get("link") or 
+                    yt_data.get("media")
+                )
+                if not yt_media_url and "links" in yt_data:
+                    links = yt_data["links"]
+                    if isinstance(links, dict):
+                        for k, v in links.items():
+                            if isinstance(v, dict):
+                                yt_media_url = v.get("url") or v.get("link")
+                                if yt_media_url:
+                                    break
+                            elif isinstance(v, str):
+                                yt_media_url = v
+                                break
+                    elif isinstance(links, list) and len(links) > 0:
+                        yt_media_url = links[0].get("url") if isinstance(links[0], dict) else links[0]
+
+            if yt_media_url and str(yt_media_url).startswith("http"):
+                v_bytes = requests.get(yt_media_url, timeout=30).content
+                
+                # Check if audio format or video format
+                is_audio = ".mp3" in yt_media_url.lower() or "audio" in yt_media_url.lower()
+                
+                if is_audio:
+                    bot.send_chat_action(message.chat.id, 'upload_audio')
+                    f_path = "downloads/yt_audio.mp3"
+                    with open(f_path, "wb") as f:
+                        f.write(v_bytes)
+                    with open(f_path, "rb") as audio:
+                        bot.send_audio(message.chat.id, audio, caption=BOT_CAPTION)
+                else:
+                    bot.send_chat_action(message.chat.id, 'upload_video')
+                    f_path = "downloads/yt_video.mp4"
+                    with open(f_path, "wb") as f:
+                        f.write(v_bytes)
+                    with open(f_path, "rb") as video:
+                        bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
+
+                if os.path.exists(f_path):
+                    os.remove(f_path)
+                return
+
+        except Exception as yt_err:
+            print("[YOUTUBE API ERROR] RapidAPI call failed, switching to fallback:", yt_err)
+
+    # --- FALLBACK FOR OTHER PLATFORMS (INSTAGRAM, X, ETC & YOUTUBE FALLBACK) ---
     bot.send_chat_action(message.chat.id, 'upload_video')
 
     ydl_opts = {

@@ -371,9 +371,14 @@ def handle_download(message):
         bot.send_chat_action(message.chat.id, 'typing')
         bot.reply_to(
             message,
-            "⚠️ <b>Unable to download this media right now.</b>\n\n"
-            "This link may be private, age-restricted, or exceeds Telegram's 50MB file size limit. "
-            "Please check the link and try again!",
+            "⚠️ <b>Incorrect or Unavailable Link!</b>\n\n"
+            "The link you provided is incorrect, expired, private, or cannot be processed right now.\n\n"
+            "Please check your link and make sure you copy a valid URL from:\n"
+            "• <b>TikTok</b>\n"
+            "• <b>Instagram</b>\n"
+            "• <b>Pinterest</b>\n"
+            "• <b>Snapchat</b>\n"
+            "• <b>X (Twitter)</b>",
             parse_mode="HTML"
         )
 

@@ -39,7 +39,6 @@ CHANNEL_ID = "-1004478024359"
 # --- RAPIDAPI CREDENTIALS ---
 RAPIDAPI_KEY = "b421dd92a6mshcb73f4d602e7481p15d069jsn93478fd56f7b"
 PINTEREST_API_HOST = "pinterest-video-and-image-downloader.p.rapidapi.com"
-YOUTUBE_API_HOST = "youtube-video-and-shorts-downloader.p.rapidapi.com"
 
 USER_FILE = "users.txt"
 
@@ -105,7 +104,7 @@ def get_all_users():
         return f.read().splitlines()
 
 def unshorten_url(url):
-    """Expands short links like pin.it or youtu.be to full URLs cleanly."""
+    """Expands short links like pin.it cleanly."""
     try:
         response = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=30)
         return response.url
@@ -122,7 +121,6 @@ def send_welcome(message):
         "Send me any link from:\n"
         "• TikTok (No Watermark videos & photo slideshows)\n"
         "• Instagram (Reels & Photos)\n"
-        "• YouTube (Shorts, Long Videos & Music)\n"
         "• Pinterest (Videos & High-Res Photos)\n"
         "• Snapchat & X (Twitter)\n\n"
         "Just paste your link below to start! 🚀"
@@ -146,7 +144,7 @@ def broadcast_message(message):
             message, 
             "⚠️ <b>Please include a message to broadcast.</b>\n\n"
             "<b>Example:</b>\n"
-            "<code>/broadcast 🚀 Great news! YouTube downloads (Shorts, Videos, Music) are fully restored! Try pasting any YouTube link now.</code>", 
+            "<code>/broadcast 🚀 Downloads for TikTok, Instagram, and Pinterest are running smoothly!</code>", 
             parse_mode="HTML"
         )
         return
@@ -191,6 +189,16 @@ def handle_download(message):
         return
 
     url = unshorten_url(raw_url)
+
+    # --- YOUTUBE MAINTENANCE BLOCK ---
+    if any(yt_domain in url for yt_domain in ["youtube.com", "youtu.be", "music.youtube.com"]):
+        bot.reply_to(
+            message,
+            "⚠️ <b>YouTube downloading is currently offline for maintenance.</b>\n\n"
+            "Please send links from TikTok, Instagram, Pinterest, Snapchat, or X (Twitter)!",
+            parse_mode="HTML"
+        )
+        return
 
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
@@ -296,85 +304,7 @@ def handle_download(message):
         except Exception as p_err:
             print("[PINTEREST ERROR] RapidAPI call failed:", p_err)
 
-    # --- RAPIDAPI YOUTUBE ENGINE (SHORTS, LONG VIDEOS & MUSIC) ---
-    if "youtube.com" in url or "youtu.be" in url or "music.youtube.com" in url:
-        try:
-            bot.send_chat_action(message.chat.id, 'upload_video')
-            
-            yt_endpoint = "https://youtube-video-and-shorts-downloader.p.rapidapi.com/"
-            yt_headers = {
-                "x-rapidapi-host": YOUTUBE_API_HOST,
-                "x-rapidapi-key": RAPIDAPI_KEY
-            }
-            yt_params = {
-                "url": url
-            }
-            
-            response = requests.get(yt_endpoint, headers=yt_headers, params=yt_params, timeout=30)
-            yt_data = response.json()
-            print(f"[YOUTUBE API LOG] Response: {yt_data}")
-
-            yt_media_url = None
-            if isinstance(yt_data, dict):
-                yt_media_url = (
-                    yt_data.get("download_url") or 
-                    yt_data.get("url") or 
-                    yt_data.get("link") or 
-                    yt_data.get("media") or
-                    yt_data.get("video") or
-                    yt_data.get("videoUrl")
-                )
-                if not yt_media_url and "links" in yt_data:
-                    links = yt_data["links"]
-                    if isinstance(links, dict):
-                        for k, v in links.items():
-                            if isinstance(v, dict):
-                                yt_media_url = v.get("url") or v.get("link")
-                                if yt_media_url:
-                                    break
-                            elif isinstance(v, str):
-                                yt_media_url = v
-                                break
-                    elif isinstance(links, list) and len(links) > 0:
-                        yt_media_url = links[0].get("url") if isinstance(links[0], dict) else links[0]
-                        
-                if not yt_media_url and "formats" in yt_data:
-                    formats = yt_data["formats"]
-                    if isinstance(formats, list) and len(formats) > 0:
-                        for f in formats:
-                            if isinstance(f, dict) and (f.get("url") or f.get("link")):
-                                yt_media_url = f.get("url") or f.get("link")
-                                break
-
-            if yt_media_url and str(yt_media_url).startswith("http"):
-                v_bytes = requests.get(yt_media_url, timeout=30).content
-                
-                # Check if audio format or video format
-                is_audio = ".mp3" in yt_media_url.lower() or "audio" in yt_media_url.lower()
-                
-                if is_audio:
-                    bot.send_chat_action(message.chat.id, 'upload_audio')
-                    f_path = "downloads/yt_audio.mp3"
-                    with open(f_path, "wb") as f:
-                        f.write(v_bytes)
-                    with open(f_path, "rb") as audio:
-                        bot.send_audio(message.chat.id, audio, caption=BOT_CAPTION)
-                else:
-                    bot.send_chat_action(message.chat.id, 'upload_video')
-                    f_path = "downloads/yt_video.mp4"
-                    with open(f_path, "wb") as f:
-                        f.write(v_bytes)
-                    with open(f_path, "rb") as video:
-                        bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
-
-                if os.path.exists(f_path):
-                    os.remove(f_path)
-                return
-
-        except Exception as yt_err:
-            print("[YOUTUBE API ERROR] RapidAPI call failed, switching to fallback:", yt_err)
-
-    # --- FALLBACK FOR OTHER PLATFORMS (INSTAGRAM, X, ETC & YOUTUBE FALLBACK) ---
+    # --- FALLBACK FOR OTHER PLATFORMS (INSTAGRAM, X, SNAPCHAT, ETC.) ---
     bot.send_chat_action(message.chat.id, 'upload_video')
 
     ydl_opts = {

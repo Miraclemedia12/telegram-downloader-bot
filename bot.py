@@ -185,17 +185,46 @@ def handle_download(message):
     raw_url = message.text.strip()
     
     if not raw_url.startswith("http"):
+        bot.send_chat_action(message.chat.id, 'typing')
         bot.reply_to(message, "⚠️ Please send a valid social media link!")
         return
 
-    url = unshorten_url(raw_url)
+    url = unshorten_url(raw_url).lower()
 
     # --- YOUTUBE MAINTENANCE BLOCK ---
     if any(yt_domain in url for yt_domain in ["youtube.com", "youtu.be", "music.youtube.com"]):
+        bot.send_chat_action(message.chat.id, 'typing')
         bot.reply_to(
             message,
             "⚠️ <b>YouTube downloading is currently offline for maintenance.</b>\n\n"
             "Please send links from TikTok, Instagram, Pinterest, Snapchat, or X (Twitter)!",
+            parse_mode="HTML"
+        )
+        return
+
+    # --- SUPPORTED PLATFORMS VALIDATION CHECK ---
+    supported_domains = [
+        "tiktok.com",
+        "pinterest.com",
+        "pin.it",
+        "instagram.com",
+        "instagr.am",
+        "twitter.com",
+        "x.com",
+        "snapchat.com"
+    ]
+
+    if not any(domain in url for domain in supported_domains):
+        bot.send_chat_action(message.chat.id, 'typing')
+        bot.reply_to(
+            message,
+            "⚠️ <b>Unsupported Link or Platform</b>\n\n"
+            "Please send a valid link from one of our supported platforms:\n"
+            "• <b>TikTok</b>\n"
+            "• <b>Instagram</b>\n"
+            "• <b>Pinterest</b>\n"
+            "• <b>Snapchat</b>\n"
+            "• <b>X (Twitter)</b>",
             parse_mode="HTML"
         )
         return
@@ -208,7 +237,7 @@ def handle_download(message):
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             api_url = "https://www.tikwm.com/api/"
-            res = requests.get(api_url, params={'url': url}, timeout=30).json()
+            res = requests.get(api_url, params={'url': raw_url}, timeout=30).json()
 
             if res.get("code") == 0 and "data" in res:
                 data = res["data"]
@@ -259,7 +288,7 @@ def handle_download(message):
                 "x-rapidapi-key": RAPIDAPI_KEY
             }
             
-            response = requests.get(api_endpoint, headers=api_headers, params={"url": url}, timeout=30)
+            response = requests.get(api_endpoint, headers=api_headers, params={"url": raw_url}, timeout=30)
             data = response.json()
             
             print(f"[PINTEREST API LOG] Response: {data}")
@@ -321,7 +350,7 @@ def handle_download(message):
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            info = ydl.extract_info(raw_url, download=True)
             filename = ydl.prepare_filename(info)
 
         if filename.endswith(('.jpg', '.jpeg', '.png', '.webp')):
@@ -337,8 +366,9 @@ def handle_download(message):
             os.remove(filename)
 
     except Exception as e:
-        print(f"[SERVER LOG] Download failed for {url}: {str(e)}")
+        print(f"[SERVER LOG] Download failed for {raw_url}: {str(e)}")
         
+        bot.send_chat_action(message.chat.id, 'typing')
         bot.reply_to(
             message,
             "⚠️ <b>Unable to download this media right now.</b>\n\n"

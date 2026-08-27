@@ -26,20 +26,15 @@ def keep_alive():
     t = Thread(target=run)
     t.start()
 
-# --- TELEGRAM BOT LOGIC ---
-BOT_TOKEN = "8651304992:AAGYe5xn993XkWdmMbNyQlJWX2ewYe_OvdM"
+# --- HIDDEN SECRETS & ENVIRONMENT VARIABLES ---
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+ADMIN_ID = os.environ.get("ADMIN_ID")
+CHANNEL_ID = os.environ.get("CHANNEL_ID")
+RAPIDAPI_KEY = os.environ.get("RAPIDAPI_KEY")
+
+# --- NON-SENSITIVE CONFIGURATION ---
 BOT_CAPTION = "Downloaded via @Mediagrab001_Bot"
-
-# 🔑 YOUR NUMERIC TELEGRAM USER ID
-ADMIN_ID = "5917904582"
-
-# 📢 YOUR PRIVATE TELEGRAM DATABASE CHANNEL ID
-CHANNEL_ID = "-1004478024359"
-
-# --- RAPIDAPI CREDENTIALS ---
-RAPIDAPI_KEY = "b421dd92a6mshcb73f4d602e7481p15d069jsn93478fd56f7b"
 PINTEREST_API_HOST = "pinterest-video-and-image-downloader.p.rapidapi.com"
-
 USER_FILE = "users.txt"
 
 bot = telebot.TeleBot(BOT_TOKEN)

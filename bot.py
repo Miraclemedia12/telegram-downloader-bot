@@ -226,26 +226,25 @@ def handle_download(message):
 
     # --- TIKTOK BULLETPROOF ENGINE (TIKWM + YT-DLP FALLBACK) ---
     if "tiktok.com" in url or "vt.tiktok.com" in url or "vm.tiktok.com" in url:
-        tiktok_success = False
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             api_url = "https://www.tikwm.com/api/"
-            res = requests.get(api_url, params={'url': raw_url}, timeout=30).json()
+            res = requests.get(api_url, params={'url': raw_url}, headers=HEADERS, timeout=30).json()
 
             if res.get("code") == 0 and "data" in res:
                 data = res["data"]
                 
-                # Handle TikTok photo slideshows
+                # Handle TikTok photo slideshows (Pictures)
                 if "images" in data and data["images"]:
                     bot.send_chat_action(message.chat.id, 'upload_photo')
                     for idx, img_url in enumerate(data["images"]):
-                        img_bytes = requests.get(img_url, timeout=30).content
+                        img_bytes = requests.get(img_url, headers=HEADERS, timeout=30).content
                         img_path = f"downloads/tt_photo_{idx}.jpg"
                         with open(img_path, "wb") as f:
                             f.write(img_bytes)
                         with open(img_path, "rb") as photo:
                             cap = BOT_CAPTION if idx == 0 else None
-                            bot.send_photo(message.chat.id, photo, caption=cap)
+                            bot.send_photo(message.chat.id, photo, caption=cap, parse_mode="HTML")
                         if os.path.exists(img_path):
                             os.remove(img_path)
                     return
@@ -254,7 +253,7 @@ def handle_download(message):
                 play_url = data.get("play") or data.get("hdplay")
                 if play_url:
                     video_url = play_url if play_url.startswith("http") else "https://www.tikwm.com" + play_url
-                    video_bytes = requests.get(video_url, timeout=30).content
+                    video_bytes = requests.get(video_url, headers=HEADERS, timeout=30).content
                     file_path = "downloads/tiktok_no_watermark.mp4"
                     
                     with open(file_path, "wb") as f:
@@ -270,7 +269,7 @@ def handle_download(message):
         except Exception as err:
             print("TikWM API error, switching to yt-dlp TikTok fallback:", err)
 
-        # Bulletproof fallback for TikTok using yt-dlp if TikWM fails
+        # Bulletproof fallback for TikTok videos using yt-dlp if TikWM fails
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             ydl_opts = {
@@ -329,7 +328,7 @@ def handle_download(message):
                 
                 if is_video:
                     bot.send_chat_action(message.chat.id, 'upload_video')
-                    v_bytes = requests.get(media_url, timeout=30).content
+                    v_bytes = requests.get(media_url, headers=HEADERS, timeout=30).content
                     f_path = "downloads/pin_video.mp4"
                     with open(f_path, "wb") as f:
                         f.write(v_bytes)
@@ -340,7 +339,7 @@ def handle_download(message):
                     return
                 else:
                     bot.send_chat_action(message.chat.id, 'upload_photo')
-                    i_bytes = requests.get(media_url, timeout=30).content
+                    i_bytes = requests.get(media_url, headers=HEADERS, timeout=30).content
                     f_path = "downloads/pin_photo.jpg"
                     with open(f_path, "wb") as f:
                         f.write(i_bytes)

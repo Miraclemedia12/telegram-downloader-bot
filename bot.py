@@ -424,6 +424,15 @@ def list_media_files(folder):
     return found
 
 
+def instagram_cookies_present():
+    """True when cookies.txt exists and contains Instagram login cookies."""
+    try:
+        with open("cookies.txt", "r", errors="ignore") as cf:
+            return "instagram.com" in cf.read()
+    except Exception:
+        return False
+
+
 def run_gallery_dl(url, work_dir, timeout=150):
     """gallery-dl knows TikTok photo posts, Instagram posts/carousels, Facebook photos/albums and X/Twitter images,
     which yt-dlp cannot download. Uses cookies.txt automatically when it exists."""
@@ -432,6 +441,9 @@ def run_gallery_dl(url, work_dir, timeout=150):
     if os.path.exists("cookies.txt"):
         cmd += ["--cookies", "cookies.txt"]
     cmd.append(url)
+    low_url = url.lower()
+    if ("instagram.com" in low_url or "instagr.am" in low_url) and not instagram_cookies_present():
+        timeout = min(timeout, 25)      # without a login Instagram just stalls gallery-dl, so do not wait 150 s
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     files = list_media_files(work_dir)
     if not files:
@@ -636,6 +648,75 @@ def fetch_instagram_embed(url, work_dir, strict=False):
     return files
 
 
+def instagram_preview_slide(code, n):
+    """Asks Instagram for the link-preview page of slide number n of a post (what Facebook/Telegram see, works without
+    a login). Returns ('ok', image_url, video_url), ('out_of_range', None, None) or ('none', None, None)."""
+    meta_headers = {
+        'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+    r = requests.get(f"https://www.instagram.com/p/{code}/", params={"img_index": n},
+                     headers=meta_headers, timeout=30, allow_redirects=True)
+    body = r.text
+    if re.search(r'media number out of range', body, re.I):
+        return ('out_of_range', None, None)
+    image = video = None
+    junk = ("rsrc.php", "static.xx.fbcdn.net", "static.cdninstagram.com")
+    for tag in re.findall(r'<meta\b[^>]*>', body, flags=re.I):
+        prop = re.search(r'(?:property|name)=["\']([^"\']+)["\']', tag, re.I)
+        cont = re.search(r'content=["\']([^"\']+)["\']', tag, re.I)
+        if not prop or not cont:
+            continue
+        p, u = prop.group(1).lower(), html.unescape(cont.group(1))
+        if not u.startswith("http") or any(j in u for j in junk):
+            continue
+        if p == 'og:image' and not image:
+            image = u
+        elif p in ('og:video', 'og:video:secure_url', 'og:video:url') and not video:
+            video = u
+    if image or video:
+        return ('ok', image, video)
+    return ('none', None, None)
+
+
+def fetch_instagram_preview_slides(url, work_dir):
+    """Instagram carousels without a login: asks for slide 1, 2, 3... of the post's preview page and collects each
+    slide's picture (or video) until Instagram says 'Media number out of range'."""
+    m = re.search(r'instagram\.com/(?:[^/?#]+/)?p/([A-Za-z0-9_-]+)', url, re.I)
+    if not m:
+        raise Exception("not an Instagram photo/carousel post link")
+    code = m.group(1)
+    slides, seen = [], set()
+    for n in range(1, 11):
+        status, image, video = instagram_preview_slide(code, n)
+        if status != 'ok':
+            break
+        key = (video or image).split('?')[0]
+        if key in seen:            # Instagram ignored the slide number and showed the same thing again
+            break
+        seen.add(key)
+        slides.append((image, video))
+        time.sleep(0.4)
+    print(f"[IG-PREVIEW] {code}: {len(slides)} slide(s) found through the preview pages")
+    files = []
+    for idx, (image, video) in enumerate(slides, 1):
+        done = False
+        if video:
+            try:
+                files.append(download_video(video, work_dir, idx))
+                done = True
+            except Exception as e:
+                print(f"[IG-PREVIEW] slide {idx} video skipped: {e}")
+        if not done and image:
+            try:
+                files.append(download_image(image, work_dir, idx))
+            except Exception as e:
+                print(f"[IG-PREVIEW] slide {idx} picture skipped: {e}")
+    if not files:
+        raise Exception("preview pages gave no usable slide")
+    return files
+
+
 def fetch_page_meta_images(url, work_dir):
     """Last resort for public photo posts (e.g. Facebook): reads the og:image picture(s) the page shows to link previews."""
     low = url.lower()
@@ -688,6 +769,7 @@ def find_fuller_media_set(raw_url, resolved_url, have_files, skip_names=()):
         engines.append(("gallery-dl", lambda d: run_gallery_dl(resolved_url, d)))
         if raw_url != resolved_url:
             engines.append(("gallery-dl (original link)", lambda d: run_gallery_dl(raw_url, d)))
+        engines.append(("Instagram preview slides", lambda d: fetch_instagram_preview_slides(resolved_url, d)))
         if not have_video:
             engines.append(("Instagram embed", lambda d: fetch_instagram_embed(resolved_url, d)))
         else:                          # first slide is a video: only accept the embed page's real slide list (no thumbnails)
@@ -730,6 +812,12 @@ def try_photo_engines(chat_id, raw_url, resolved_url):
         engines.append(("gallery-dl (original link)", lambda d: run_gallery_dl(raw_url, d)))
     if is_instagram:
         engines.append(("Instagram embed", lambda d: fetch_instagram_embed(resolved_url, d)))
+    if is_instagram:
+        slide_engine = ("Instagram preview slides", lambda d: fetch_instagram_preview_slides(resolved_url, d))
+        if instagram_cookies_present():
+            engines.insert(len(engines) - 1 if engines and engines[-1][0] == "Instagram embed" else len(engines), slide_engine)
+        else:
+            engines.insert(0, slide_engine)   # no login: gallery-dl cannot work, so try the quick slide-by-slide way first
     if not is_x:
         engines.append(("page preview", lambda d: fetch_page_meta_images(resolved_url, d)))
 
@@ -882,6 +970,24 @@ def instagram_test(message):
                 lines.append(f"  post pictures seen by page scan: {len(scrape_instagram_post_images(page))}")
             except Exception as e:
                 lines.append(f"Embed page failed: {str(e)[:300]}")
+
+        if code:
+            try:
+                seen_keys, report = set(), []
+                for n in range(1, 11):
+                    status, image, video = instagram_preview_slide(code.group(1), n)
+                    if status != 'ok':
+                        report.append(f"#{n}: {status}")
+                        break
+                    key = (video or image).split('?')[0]
+                    if key in seen_keys:
+                        report.append(f"#{n}: same as an earlier one (slide number ignored)")
+                        break
+                    seen_keys.add(key)
+                    report.append(f"#{n}: {'video' if video else 'picture'}")
+                lines.append("Preview slides: " + ", ".join(report))
+            except Exception as e:
+                lines.append(f"Preview slides failed: {str(e)[:300]}")
 
         os.makedirs("downloads", exist_ok=True)
         work_dir = tempfile.mkdtemp(prefix="igtest_", dir="downloads")

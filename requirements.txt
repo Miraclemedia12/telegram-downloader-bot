@@ -1,4 +1,5 @@
 pyTelegramBotAPI
 yt-dlp
+gallery-dl
 requests
 Flask

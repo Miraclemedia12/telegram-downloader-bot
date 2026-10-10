@@ -783,8 +783,8 @@ def find_fuller_media_set(raw_url, resolved_url, have_files, skip_names=()):
     elif is_instagram:
         if re.search(r'/(?:reel|reels|tv)/', low):
             return None, None          # reels are always a single video, nothing to look for
-        if have_count > 1:
-            return None, None          # already got several slides
+        if have_count > 1 and not instagram_cookies_present():
+            return None, None          # already got several slides (and no login to find more with)
         engines.append(("gallery-dl", lambda d: run_gallery_dl(resolved_url, d)))
         if raw_url != resolved_url:
             engines.append(("gallery-dl (original link)", lambda d: run_gallery_dl(raw_url, d)))

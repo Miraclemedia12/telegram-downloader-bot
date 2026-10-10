@@ -1,10 +1,25 @@
 import os
 import re
+import sys
+import json
+import html
+import time
+import shutil
+import tempfile
+import subprocess
 import requests
 import telebot
 import yt_dlp
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
-from threading import Thread
+from threading import Thread, Event
+
+# Pillow is optional: it is only used to make sure every picture is in a format/size Telegram accepts.
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 # --- COOKIE ENVIRONMENT CHECK ---
 if os.environ.get("YOUTUBE_COOKIES"):
@@ -106,6 +121,446 @@ def unshorten_url(url):
     except Exception:
         return url
 
+# =====================================================================================
+# --- PHOTO / SLIDESHOW ENGINE (TikTok slides, Instagram, Facebook, X/Twitter, ...) ---
+# =====================================================================================
+TELEGRAM_ALBUM_LIMIT = 10                 # Telegram only accepts 2-10 pictures per album
+TG_PHOTO_MAX_BYTES = 10 * 1024 * 1024     # Telegram's limit for a picture sent as "photo"
+TG_PHOTO_MAX_SIDES = 10000                # width + height limit for "photo"
+TG_PHOTO_MAX_RATIO = 20                   # longest side / shortest side limit for "photo"
+MAX_VIDEO_BYTES = 50 * 1024 * 1024        # Telegram's bot upload limit
+PHOTO_EXTS = ('.jpg', '.jpeg', '.png', '.webp')
+VIDEO_EXTS = ('.mp4', '.mov', '.m4v', '.webm', '.mkv')
+
+
+class PhotoProgress:
+    """Shows 'sending photo…' at the top of the chat for as long as the work takes
+    (Telegram clears that indicator after ~5s, so it is refreshed in the background),
+    plus an optional small status message that is removed again when everything is sent."""
+
+    def __init__(self, chat_id, action='upload_photo'):
+        self.chat_id = chat_id
+        self.action = action
+        self._stop = Event()
+        self._status_id = None
+
+    def _loop(self):
+        while not self._stop.is_set():
+            try:
+                bot.send_chat_action(self.chat_id, self.action)
+            except Exception:
+                pass
+            self._stop.wait(4)
+
+    def say(self, text):
+        """Create (or update) the status message."""
+        try:
+            if self._status_id is None:
+                self._status_id = bot.send_message(self.chat_id, text).message_id
+            else:
+                bot.edit_message_text(text, self.chat_id, self._status_id)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        Thread(target=self._loop, daemon=True).start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._status_id is not None:
+            try:
+                bot.delete_message(self.chat_id, self._status_id)
+            except Exception:
+                pass
+        return False
+
+
+def tg_call(func, *args, **kwargs):
+    """Runs a Telegram call and politely waits + retries when Telegram answers 'too many requests' (429)."""
+    for attempt in range(4):
+        try:
+            return func(*args, **kwargs)
+        except telebot.apihelper.ApiTelegramException as e:
+            if e.error_code == 429 and attempt < 3:
+                wait = 5
+                try:
+                    wait = int(e.result_json.get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    pass
+                time.sleep(min(wait, 30) + 1)
+                continue
+            raise
+
+
+def sniff_image_ext(data):
+    """Looks at the first bytes to tell if the download is really a picture (and which kind)."""
+    if data[:3] == b'\xff\xd8\xff':
+        return 'jpg'
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'png'
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'webp'
+    return None
+
+
+def download_image(url, dest_dir, idx):
+    """Downloads one picture (url can also be a list of alternatives to try in order). Returns the file path."""
+    candidates = url if isinstance(url, (list, tuple)) else [url]
+    last_err = None
+    for attempt in range(3):
+        for candidate in candidates:
+            try:
+                r = requests.get(candidate, headers=HEADERS, timeout=60)
+                r.raise_for_status()
+                ext = sniff_image_ext(r.content)
+                if not ext:
+                    raise ValueError("download is not a picture (blocked or expired link?)")
+                path = os.path.join(dest_dir, f"photo_{idx:03d}.{ext}")
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                return path
+            except Exception as e:
+                last_err = e
+        time.sleep(1)
+    raise last_err
+
+
+def download_images(urls, dest_dir):
+    """Downloads many pictures at once, keeping their order. Pictures that fail are skipped (and logged)."""
+    def one(item):
+        idx, u = item
+        try:
+            return download_image(u, dest_dir, idx)
+        except Exception as e:
+            print(f"[PHOTO] Could not download picture {idx}: {e}")
+            return None
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        results = list(pool.map(one, enumerate(urls, 1)))
+    return [p for p in results if p]
+
+
+def download_video(url, dest_dir, idx):
+    """Downloads one video file (refuses anything above Telegram's 50 MB bot limit)."""
+    path = os.path.join(dest_dir, f"video_{idx:02d}.mp4")
+    with requests.get(url, headers=HEADERS, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = 0
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=256 * 1024):
+                total += len(chunk)
+                if total > MAX_VIDEO_BYTES:
+                    raise ValueError("video is too large for Telegram")
+                f.write(chunk)
+    return path
+
+
+def prepare_photo(path):
+    """Makes sure Telegram accepts the picture as a real photo (JPEG/PNG, <=10 MB, width+height <= 10000).
+    Returns (path_to_send, send_as_file). Odd formats (WEBP etc.) are converted to JPEG and giant pictures are
+    shrunk. Pictures that can't be a 'photo' at all (e.g. extremely tall) are sent as a file so nothing is lost."""
+    size = os.path.getsize(path)
+    if not PIL_AVAILABLE:
+        return path, size > TG_PHOTO_MAX_BYTES
+    try:
+        with Image.open(path) as im:
+            im.load()
+            w, h = im.size
+            fmt = im.format
+            if max(w, h) / max(1, min(w, h)) > TG_PHOTO_MAX_RATIO:
+                return path, True
+            if fmt in ('JPEG', 'PNG') and size <= TG_PHOTO_MAX_BYTES and (w + h) <= TG_PHOTO_MAX_SIDES:
+                return path, False
+
+            if (w + h) > TG_PHOTO_MAX_SIDES:
+                scale = TG_PHOTO_MAX_SIDES / (w + h) * 0.98
+                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.LANCZOS)
+            im = im.convert("RGB")
+            out = os.path.splitext(path)[0] + "_tg.jpg"
+            quality = 92
+            while True:
+                im.save(out, "JPEG", quality=quality, optimize=True)
+                if os.path.getsize(out) <= TG_PHOTO_MAX_BYTES or quality <= 60:
+                    break
+                quality -= 10
+            return out, os.path.getsize(out) > TG_PHOTO_MAX_BYTES
+    except Exception as e:
+        print(f"[PHOTO] Could not inspect {path}: {e}")
+        return path, size > TG_PHOTO_MAX_BYTES
+
+
+def _send_photo_chunk(chat_id, paths, caption):
+    """Sends 1 photo, or 2-10 photos as one album. Files are opened here so a retry starts from a clean file."""
+    handles = []
+    try:
+        if len(paths) == 1:
+            f = open(paths[0], 'rb')
+            handles.append(f)
+            bot.send_photo(chat_id, f, caption=caption or None, parse_mode="HTML")
+        else:
+            media = []
+            for idx, p in enumerate(paths):
+                f = open(p, 'rb')
+                handles.append(f)
+                cap = caption if idx == 0 else None
+                media.append(telebot.types.InputMediaPhoto(f, caption=cap or None, parse_mode="HTML"))
+            bot.send_media_group(chat_id, media)
+    finally:
+        for f in handles:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+
+def _send_documents(chat_id, paths, caption):
+    """Last resort for pictures Telegram refuses as 'photo': send them as files so the user still gets them."""
+    for idx, p in enumerate(paths):
+        with open(p, 'rb') as f:
+            bot.send_document(chat_id, f, caption=(caption if idx == 0 else None) or None, parse_mode="HTML")
+
+
+def _send_video_file(chat_id, path):
+    with open(path, 'rb') as video:
+        bot.send_video(chat_id, video, caption=BOT_CAPTION, parse_mode="HTML")
+
+
+def send_photo_files(chat_id, paths, caption=BOT_CAPTION):
+    """Sends ANY number of pictures, in order: albums of up to 10 (Telegram's limit), caption on the first one."""
+    as_photo, as_file = [], []
+    for p in paths:
+        send_path, send_as_file = prepare_photo(p)
+        (as_file if send_as_file else as_photo).append(send_path)
+
+    first = True
+    for i in range(0, len(as_photo), TELEGRAM_ALBUM_LIMIT):
+        chunk = as_photo[i:i + TELEGRAM_ALBUM_LIMIT]
+        cap = caption if first else None
+        try:
+            tg_call(_send_photo_chunk, chat_id, chunk, cap)
+        except telebot.apihelper.ApiTelegramException as e:
+            print(f"[PHOTO] Telegram refused the album ({e}); sending the pictures as files instead.")
+            tg_call(_send_documents, chat_id, chunk, cap)
+        first = False
+        if i + TELEGRAM_ALBUM_LIMIT < len(as_photo):
+            time.sleep(1)   # be gentle with Telegram's flood limits between albums
+
+    if as_file:
+        tg_call(_send_documents, chat_id, as_file, caption if first else None)
+
+
+def send_media_files(chat_id, paths):
+    """Sends a mixed list of downloaded files: pictures first (as albums), then videos one by one."""
+    photos = [p for p in paths if p.lower().endswith(PHOTO_EXTS)]
+    videos = [p for p in paths if p not in photos]
+    if photos:
+        bot.send_chat_action(chat_id, 'upload_photo')
+        send_photo_files(chat_id, photos)
+    for v_path in videos:
+        bot.send_chat_action(chat_id, 'upload_video')
+        tg_call(_send_video_file, chat_id, v_path)
+
+
+def send_photo_urls(chat_id, image_urls):
+    """Downloads every picture from a list of direct links and sends them all to the chat.
+    Used for TikTok slideshows. Raises if NOTHING could be downloaded so the caller can try another engine."""
+    os.makedirs("downloads", exist_ok=True)
+    work_dir = tempfile.mkdtemp(prefix="photos_", dir="downloads")
+    try:
+        with PhotoProgress(chat_id) as progress:
+            count = len(image_urls)
+            progress.say(f"📸 Sending {count} photo{'s' if count != 1 else ''}, please wait...")
+            paths = download_images(image_urls, work_dir)
+            if not paths:
+                raise Exception("none of the photos could be downloaded")
+            try:
+                send_photo_files(chat_id, paths)
+            except Exception as e:
+                # Some photos may already be delivered, so do NOT fall back to another engine (it would send duplicates).
+                print(f"[PHOTO] Sending to Telegram failed: {e}")
+                bot.send_message(chat_id, "⚠️ I got the photos but Telegram would not accept them. Please try again in a moment.")
+                return
+            if len(paths) < count:
+                bot.send_message(chat_id, f"⚠️ Sent {len(paths)} of {count} photos (the rest could not be downloaded).")
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+# --- PHOTO SOURCES -------------------------------------------------------------------
+def tikwm_lookup(raw_url):
+    """Asks TikWM about a TikTok post. Its free API allows ~1 request/second, so wait and retry if it says 'limit'."""
+    res = {}
+    for attempt in range(4):
+        res = requests.get("https://www.tikwm.com/api/", params={'url': raw_url}, headers=HEADERS, timeout=30).json()
+        if res.get("code") == 0 and "data" in res:
+            return res
+        if "limit" in str(res.get("msg", "")).lower() and attempt < 3:
+            time.sleep(1.5)
+            continue
+        break
+    return res
+
+
+def list_media_files(folder):
+    """Pictures + videos found in a folder, in the order they were downloaded (videos over 50 MB are skipped)."""
+    found = []
+    for root, _dirs, files in os.walk(folder):
+        for name in files:
+            full = os.path.join(root, name)
+            low = name.lower()
+            if low.endswith(PHOTO_EXTS):
+                found.append(full)
+            elif low.endswith(VIDEO_EXTS) and os.path.getsize(full) <= MAX_VIDEO_BYTES:
+                found.append(full)
+    found.sort(key=lambda p: (os.stat(p).st_mtime_ns, p))
+    return found
+
+
+def run_gallery_dl(url, work_dir, timeout=150):
+    """gallery-dl knows TikTok photo posts, Instagram posts/carousels, Facebook photos/albums and X/Twitter images,
+    which yt-dlp cannot download. Uses cookies.txt automatically when it exists."""
+    cmd = [sys.executable, "-m", "gallery_dl", "-D", work_dir, "--no-mtime",
+           "-o", "extractor.tiktok.audio=false"]
+    if os.path.exists("cookies.txt"):
+        cmd += ["--cookies", "cookies.txt"]
+    cmd.append(url)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    files = list_media_files(work_dir)
+    if not files:
+        tail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        raise Exception(f"gallery-dl found nothing (exit {proc.returncode}): {tail}")
+    return files
+
+
+def fetch_twitter_media(url, work_dir):
+    """X/Twitter photos (and videos) through the public FxTwitter API - works without any login."""
+    m = re.search(r'(?:twitter|x)\.com/([^/?#]+)/status(?:es)?/(\d+)', url, re.I) or \
+        re.search(r'()/status(?:es)?/(\d+)', url)
+    if not m:
+        raise Exception("not a tweet link")
+    screen_name = m.group(1) or "i"
+    res = requests.get(f"https://api.fxtwitter.com/{screen_name}/status/{m.group(2)}", headers=HEADERS, timeout=30).json()
+    media = ((res.get("tweet") or {}).get("media") or {}).get("all") or []
+
+    photo_urls = []
+    for item in media:
+        if item.get("type") == "photo" and item.get("url"):
+            u = item["url"]
+            orig = u + ("&" if "?" in u else "?") + "name=orig"
+            photo_urls.append([orig, u])          # try the original quality first, then the normal one
+    files = download_images(photo_urls, work_dir)
+
+    for idx, item in enumerate(media, 1):
+        if item.get("type") in ("video", "gif") and item.get("url"):
+            try:
+                files.append(download_video(item["url"], work_dir, idx))
+            except Exception as e:
+                print(f"[TWITTER] video skipped: {e}")
+    if not files:
+        raise Exception("tweet has no downloadable media")
+    return files
+
+
+def fetch_instagram_embed(url, work_dir):
+    """Best-effort without login: reads Instagram's public embed page of the post for its picture links."""
+    m = re.search(r'instagram\.com/(?:[^/?#]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)', url, re.I)
+    if not m:
+        raise Exception("not an Instagram post link")
+    r = requests.get(f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/", headers=HEADERS, timeout=30)
+    r.raise_for_status()
+    body = r.text.replace('\\"', '"').replace('\\/', '/')
+
+    found = [u.replace('\\u0026', '&') for u in re.findall(r'"display_url"\s*:\s*"([^"]+)"', body)]
+    if not found:
+        found = [html.unescape(u) for u in re.findall(r'class="EmbeddedMediaImage"[^>]*?\ssrc="([^"]+)"', body)]
+    urls = []
+    for u in found:
+        if u.startswith("http") and u not in urls:
+            urls.append(u)
+    files = download_images(urls, work_dir)
+    if not files:
+        raise Exception("embed page had no pictures")
+    return files
+
+
+def fetch_page_meta_images(url, work_dir):
+    """Last resort for public photo posts (e.g. Facebook): reads the og:image picture(s) the page shows to link previews."""
+    low = url.lower()
+    if any(k in low for k in ("/reel", "/videos/", "/video/", "/watch", "fb.watch", "/tv/")):
+        raise Exception("video link - a thumbnail would be the wrong thing to send")
+    meta_headers = {
+        'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+        'Accept-Language': 'en-US,en;q=0.9'
+    }
+    r = requests.get(url, headers=meta_headers, timeout=30, allow_redirects=True)
+    body = r.text
+    if re.search(r'property=["\']og:video', body, re.I):
+        raise Exception("page is a video - a thumbnail would be the wrong thing to send")
+
+    urls = []
+    for tag in re.findall(r'<meta\b[^>]*>', body, flags=re.I):
+        if re.search(r'(?:property|name)=["\']og:image(?::url)?["\']', tag, re.I):
+            c = re.search(r'content=["\']([^"\']+)["\']', tag, re.I)
+            if c:
+                u = html.unescape(c.group(1))
+                junk = ("rsrc.php", "static.xx.fbcdn.net", "static.cdninstagram.com")
+                if u.startswith("http") and u not in urls and not any(j in u for j in junk):
+                    urls.append(u)
+    files = download_images(urls, work_dir)
+    if not files:
+        raise Exception("page has no usable picture")
+    return files
+
+
+def try_photo_engines(chat_id, raw_url, resolved_url):
+    """Photo-post fallbacks, used when yt-dlp could not handle the link (yt-dlp has no support for TikTok photo
+    posts, Facebook photos or Instagram image posts). Returns True if something was sent to the user."""
+    os.makedirs("downloads", exist_ok=True)
+    low = resolved_url.lower()
+    is_x = "twitter.com" in low or "x.com" in low
+    is_instagram = "instagram.com" in low or "instagr.am" in low
+
+    engines = []
+    if is_x:
+        engines.append(("FxTwitter", lambda d: fetch_twitter_media(resolved_url, d)))
+    engines.append(("gallery-dl", lambda d: run_gallery_dl(resolved_url, d)))
+    if raw_url != resolved_url:
+        engines.append(("gallery-dl (original link)", lambda d: run_gallery_dl(raw_url, d)))
+    if is_instagram:
+        engines.append(("Instagram embed", lambda d: fetch_instagram_embed(resolved_url, d)))
+    if not is_x:
+        engines.append(("page preview", lambda d: fetch_page_meta_images(resolved_url, d)))
+
+    with PhotoProgress(chat_id) as progress:
+        for name, engine in engines:
+            work_dir = tempfile.mkdtemp(prefix="photos_", dir="downloads")
+            try:
+                try:
+                    files = engine(work_dir)
+                except Exception as e:
+                    print(f"[PHOTO] {name} failed for {resolved_url}: {e}")
+                    continue
+                if not files:
+                    continue
+
+                photo_count = len([p for p in files if p.lower().endswith(PHOTO_EXTS)])
+                if photo_count:
+                    progress.say(f"📸 Sending {photo_count} photo{'s' if photo_count != 1 else ''}, please wait...")
+                else:
+                    progress.action = 'upload_video'     # only videos were found
+                try:
+                    send_media_files(chat_id, files)
+                    print(f"[PHOTO] Sent {len(files)} file(s) using {name}")
+                except Exception as e:
+                    # Something may already be delivered, so stop here instead of trying another engine (duplicates).
+                    print(f"[PHOTO] Sending to Telegram failed: {e}")
+                    bot.send_message(chat_id, "⚠️ I got the media but Telegram would not accept it. Please try again in a moment.")
+                return True
+            finally:
+                shutil.rmtree(work_dir, ignore_errors=True)
+    return False
+
 # --- COMMAND HANDLERS ---
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -176,13 +631,20 @@ def handle_download(message):
     save_user(message.chat.id)
     
     raw_url = message.text.strip()
-    
+
+    # Share buttons often add text around the link (e.g. "Check out this post https://vt.tiktok.com/..."),
+    # so pick the link out of the message instead of requiring the whole message to be only a link.
+    link_match = re.search(r'https?://\S+', raw_url)
+    if link_match:
+        raw_url = link_match.group(0).rstrip('.,;)]}>"\'')
+
     if not raw_url.startswith("http"):
         bot.send_chat_action(message.chat.id, 'typing')
         bot.reply_to(message, "⚠️ Please send a valid social media link!")
         return
 
-    url = unshorten_url(raw_url).lower()
+    resolved_url = unshorten_url(raw_url)   # same link with short-links expanded (original letter case kept)
+    url = resolved_url.lower()
 
     # --- YOUTUBE MAINTENANCE BLOCK ---
     if any(yt_domain in url for yt_domain in ["youtube.com", "youtu.be", "music.youtube.com"]):
@@ -235,47 +697,16 @@ def handle_download(message):
     if "tiktok.com" in url or "vt.tiktok.com" in url or "vm.tiktok.com" in url:
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
-            api_url = "https://www.tikwm.com/api/"
-            res = requests.get(api_url, params={'url': raw_url}, headers=HEADERS, timeout=30).json()
+            res = tikwm_lookup(raw_url)   # retries automatically if TikWM's free API says "too many requests"
 
             if res.get("code") == 0 and "data" in res:
                 data = res["data"]
-                
-                # Handle TikTok photo slideshows (Send all photos as album / media group)
-                if "images" in data and data["images"]:
-                    bot.send_chat_action(message.chat.id, 'upload_photo')
-                    image_paths = []
-                    try:
-                        for idx, img_url in enumerate(data["images"]):
-                            img_bytes = requests.get(img_url, headers=HEADERS, timeout=30).content
-                            img_path = f"downloads/tt_photo_{idx}.jpg"
-                            with open(img_path, "wb") as f:
-                                f.write(img_bytes)
-                            image_paths.append(img_path)
 
-                        if len(image_paths) > 1:
-                            media_group = []
-                            open_files = []
-                            try:
-                                for idx, p_path in enumerate(image_paths):
-                                    f_obj = open(p_path, 'rb')
-                                    open_files.append(f_obj)
-                                    cap = BOT_CAPTION if idx == 0 else ""
-                                    media_group.append(telebot.types.InputMediaPhoto(f_obj, caption=cap, parse_mode="HTML"))
-                                bot.send_media_group(message.chat.id, media_group)
-                            finally:
-                                for f_obj in open_files:
-                                    try:
-                                        f_obj.close()
-                                    except:
-                                        pass
-                        elif len(image_paths) == 1:
-                            with open(image_paths[0], 'rb') as photo:
-                                bot.send_photo(message.chat.id, photo, caption=BOT_CAPTION, parse_mode="HTML")
-                    finally:
-                        for p_path in image_paths:
-                            if os.path.exists(p_path):
-                                os.remove(p_path)
+                # Handle TikTok photo slideshows: shows "sending photo...", then sends ALL photos.
+                # (Telegram albums hold max 10 pictures, so long slideshows are sent as several albums in order.)
+                if "images" in data and data["images"]:
+                    image_urls = [u if u.startswith("http") else "https://www.tikwm.com" + u for u in data["images"]]
+                    send_photo_urls(message.chat.id, image_urls)
                     return
 
                 # Handle TikTok videos
@@ -297,6 +728,12 @@ def handle_download(message):
 
         except Exception as err:
             print("TikWM API error, switching to yt-dlp TikTok fallback:", err)
+
+        # TikTok photo post that TikWM could not give us: yt-dlp cannot read photo posts at all,
+        # so go straight to the photo engines (gallery-dl etc.) instead of wasting time on it.
+        if "/photo/" in url:
+            if try_photo_engines(message.chat.id, raw_url, resolved_url):
+                return
 
         # Bulletproof fallback for TikTok videos using yt-dlp if TikWM fails
         try:
@@ -396,13 +833,15 @@ def handle_download(message):
     if os.path.exists('cookies.txt'):
         ydl_opts['cookiefile'] = 'cookies.txt'
 
+    download_done = False      # becomes True once yt-dlp really has the file(s), so a later Telegram error is not mistaken for a bad link
+    downloaded_files = []
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(raw_url, download=True)
-            
+
             entries = info.get('entries') if info else None
             downloaded_files = []
-            
+
             if entries:
                 for entry in entries:
                     if entry:
@@ -417,38 +856,16 @@ def handle_download(message):
             if not downloaded_files:
                 raise Exception("No media files found after download.")
 
-            photo_files = [f for f in downloaded_files if f.lower().endswith(('.jpg', '.jpeg', '.png', '.webp'))]
-            video_files = [f for f in downloaded_files if f not in photo_files]
+            download_done = True
 
-            # Send photos as media group (album) if multiple, or single photo
-            if photo_files:
-                if len(photo_files) > 1:
-                    bot.send_chat_action(message.chat.id, 'upload_photo')
-                    media_group = []
-                    open_files = []
-                    try:
-                        for idx, p_path in enumerate(photo_files):
-                            f_obj = open(p_path, 'rb')
-                            open_files.append(f_obj)
-                            cap = BOT_CAPTION if idx == 0 else ""
-                            media_group.append(telebot.types.InputMediaPhoto(f_obj, caption=cap, parse_mode="HTML"))
-                        bot.send_media_group(message.chat.id, media_group)
-                    finally:
-                        for f_obj in open_files:
-                            try:
-                                f_obj.close()
-                            except:
-                                pass
-                else:
-                    bot.send_chat_action(message.chat.id, 'upload_photo')
-                    with open(photo_files[0], 'rb') as photo:
-                        bot.send_photo(message.chat.id, photo, caption=BOT_CAPTION, parse_mode="HTML")
-
-            # Send videos
-            for v_path in video_files:
-                bot.send_chat_action(message.chat.id, 'upload_video')
-                with open(v_path, 'rb') as video:
-                    bot.send_video(message.chat.id, video, caption=BOT_CAPTION, parse_mode="HTML")
+            # Pictures go out as albums of up to 10 (any number of pictures works), videos one by one
+            photo_count = len([f for f in downloaded_files if f.lower().endswith(PHOTO_EXTS)])
+            if photo_count:
+                with PhotoProgress(message.chat.id) as progress:
+                    progress.say(f"📸 Sending {photo_count} photo{'s' if photo_count != 1 else ''}, please wait...")
+                    send_media_files(message.chat.id, downloaded_files)
+            else:
+                send_media_files(message.chat.id, downloaded_files)
 
             # Cleanup all downloaded files
             for f_path in downloaded_files:
@@ -457,7 +874,27 @@ def handle_download(message):
 
     except Exception as e:
         print(f"[SERVER LOG] Download failed for {raw_url}: {str(e)}")
-        
+
+        # Whatever was downloaded must not be left behind on the server
+        for f_path in downloaded_files:
+            if os.path.exists(f_path):
+                os.remove(f_path)
+
+        if download_done:
+            # The download worked but Telegram refused the upload (for example the file is too big).
+            bot.reply_to(
+                message,
+                "⚠️ <b>I downloaded it, but Telegram would not accept the file.</b>\n\n"
+                "It may be too large to send. Please try again in a moment.",
+                parse_mode="HTML"
+            )
+            return
+
+        # yt-dlp cannot read photo posts (TikTok photos, Facebook photos, Instagram image posts...),
+        # so before giving up try the photo engines: FxTwitter (X), gallery-dl, Instagram embed, page preview.
+        if try_photo_engines(message.chat.id, raw_url, resolved_url):
+            return
+
         bot.send_chat_action(message.chat.id, 'typing')
         bot.reply_to(
             message,

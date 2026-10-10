@@ -99,7 +99,7 @@ def get_all_users():
         return f.read().splitlines()
 
 def unshorten_url(url):
-    """Expands short links like pin.it cleanly."""
+    """Expands short links cleanly."""
     try:
         response = requests.get(url, headers=HEADERS, allow_redirects=True, timeout=30)
         return response.url
@@ -127,12 +127,10 @@ def send_welcome(message):
 def broadcast_message(message):
     save_user(message.chat.id)
     
-    # Check if the sender is authorized
     if str(message.from_user.id) != str(ADMIN_ID):
         bot.reply_to(message, "⛔ You are not authorized to use this admin command!")
         return
 
-    # Get the text after the /broadcast command
     command_args = message.text.split(maxsplit=1)
     if len(command_args) < 2:
         bot.reply_to(
@@ -161,7 +159,6 @@ def broadcast_message(message):
             bot.send_message(user_id, announcement, parse_mode="HTML")
             success_count += 1
         except Exception:
-            # User might have blocked or deleted the chat with the bot
             fail_count += 1
 
     bot.send_message(
@@ -227,8 +224,9 @@ def handle_download(message):
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
 
-    # --- TIKTOK NO-WATERMARK ---
-    if "tiktok.com" in url:
+    # --- TIKTOK BULLETPROOF ENGINE (TIKWM + YT-DLP FALLBACK) ---
+    if "tiktok.com" in url or "vt.tiktok.com" in url or "vm.tiktok.com" in url:
+        tiktok_success = False
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             api_url = "https://www.tikwm.com/api/"
@@ -253,24 +251,51 @@ def handle_download(message):
                     return
 
                 # Handle TikTok videos
-                play_url = data["play"]
-                video_url = play_url if play_url.startswith("http") else "https://www.tikwm.com" + play_url
-                
-                video_bytes = requests.get(video_url, timeout=30).content
-                file_path = "downloads/tiktok_no_watermark.mp4"
-                
-                with open(file_path, "wb") as f:
-                    f.write(video_bytes)
+                play_url = data.get("play") or data.get("hdplay")
+                if play_url:
+                    video_url = play_url if play_url.startswith("http") else "https://www.tikwm.com" + play_url
+                    video_bytes = requests.get(video_url, timeout=30).content
+                    file_path = "downloads/tiktok_no_watermark.mp4"
+                    
+                    with open(file_path, "wb") as f:
+                        f.write(video_bytes)
 
-                with open(file_path, "rb") as video:
-                    bot.send_video(message.chat.id, video, caption=BOT_CAPTION, parse_mode="HTML")
+                    with open(file_path, "rb") as video:
+                        bot.send_video(message.chat.id, video, caption=BOT_CAPTION, parse_mode="HTML")
 
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                return
+                    if os.path.exists(file_path):
+                        os.remove(file_path)
+                    return
 
         except Exception as err:
-            print("TikWM API error, trying yt-dlp fallback:", err)
+            print("TikWM API error, switching to yt-dlp TikTok fallback:", err)
+
+        # Bulletproof fallback for TikTok using yt-dlp if TikWM fails
+        try:
+            bot.send_chat_action(message.chat.id, 'upload_video')
+            ydl_opts = {
+                'format': 'best[ext=mp4]/best',
+                'outtmpl': 'downloads/%(id)s.%(ext)s',
+                'max_filesize': 50 * 1024 * 1024,
+                'nocheckcertificate': True,
+                'quiet': True,
+                'http_headers': HEADERS
+            }
+            if os.path.exists('cookies.txt'):
+                ydl_opts['cookiefile'] = 'cookies.txt'
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(raw_url, download=True)
+                filename = ydl.prepare_filename(info)
+
+            with open(filename, 'rb') as video:
+                bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
+
+            if os.path.exists(filename):
+                os.remove(filename)
+            return
+        except Exception as ydl_err:
+            print("TikTok yt-dlp fallback error:", ydl_err)
 
     # --- RAPIDAPI PINTEREST ENGINE ---
     if "pinterest.com" in url or "pin.it" in url:

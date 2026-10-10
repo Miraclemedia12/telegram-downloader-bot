@@ -229,24 +229,66 @@ def handle_download(message):
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             api_url = "https://www.tikwm.com/api/"
-            res = requests.get(api_url, params={'url': raw_url}, headers=HEADERS, timeout=30).json()
+            # TikWM's documented/public examples use POST form data. A GET request
+            # can return a response without the slideshow image list.
+            api_response = requests.post(
+                api_url,
+                data={'url': raw_url, 'hd': 1},
+                headers=HEADERS,
+                timeout=30
+            )
+            api_response.raise_for_status()
+            res = api_response.json()
+            print(f"[TIKWM LOG] code={res.get('code')} msg={res.get('msg')} keys={list(res.keys())}")
 
-            if res.get("code") == 0 and "data" in res:
+            if isinstance(res, dict) and res.get("code") == 0 and isinstance(res.get("data"), dict):
                 data = res["data"]
-                
-                # Handle TikTok photo slideshows (Pictures)
-                if "images" in data and data["images"]:
-                    bot.send_chat_action(message.chat.id, 'upload_photo')
-                    for idx, img_url in enumerate(data["images"]):
-                        img_bytes = requests.get(img_url, headers=HEADERS, timeout=30).content
-                        img_path = f"downloads/tt_photo_{idx}.jpg"
-                        with open(img_path, "wb") as f:
-                            f.write(img_bytes)
-                        with open(img_path, "rb") as photo:
-                            cap = BOT_CAPTION if idx == 0 else None
-                            bot.send_photo(message.chat.id, photo, caption=cap, parse_mode="HTML")
-                        if os.path.exists(img_path):
-                            os.remove(img_path)
+
+                # TikTok photo-mode posts are not supported by yt-dlp itself.
+                # Providers may expose the image list in different response fields.
+                image_items = data.get('images')
+                if not image_items and isinstance(data.get('image_post_info'), dict):
+                    image_items = data['image_post_info'].get('images')
+                if not image_items and isinstance(data.get('imagePostInfo'), dict):
+                    image_items = data['imagePostInfo'].get('images')
+
+                image_urls = []
+                if isinstance(image_items, list):
+                    for item in image_items:
+                        if isinstance(item, str) and item.startswith('http'):
+                            image_urls.append(item)
+                        elif isinstance(item, dict):
+                            candidate = (item.get('url') or item.get('url_list') or
+                                         item.get('image_url') or item.get('display_url'))
+                            if isinstance(candidate, list):
+                                candidate = next((x for x in candidate if isinstance(x, str) and x.startswith('http')), None)
+                            if isinstance(candidate, str) and candidate.startswith('http'):
+                                image_urls.append(candidate)
+
+                if image_urls:
+                    for idx, img_url in enumerate(image_urls):
+                        img_path = f"downloads/tt_photo_{message.chat.id}_{idx}.jpg"
+                        try:
+                            img_response = requests.get(img_url, headers=HEADERS, timeout=30)
+                            img_response.raise_for_status()
+                            with open(img_path, "wb") as f:
+                                f.write(img_response.content)
+                            with open(img_path, "rb") as photo:
+                                cap = BOT_CAPTION if idx == 0 else None
+                                bot.send_photo(message.chat.id, photo, caption=cap, parse_mode="HTML")
+                        finally:
+                            if os.path.exists(img_path):
+                                os.remove(img_path)
+                    return
+
+                # Don't send photo-mode URLs to yt-dlp: its extractor reports
+                # Unsupported URL for TikTok /photo/ posts.
+                if re.search(r'tiktok\.com/@[^/]+/photo/', url, re.I):
+                    print(f"[TIKWM PHOTO ERROR] No image URLs returned. Response keys: {list(data.keys())}")
+                    bot.reply_to(
+                        message,
+                        "⚠️ I couldn't retrieve the photos from this TikTok post. The download provider did not return its image list. Please try again later or send a TikTok video link."
+                    )
                     return
 
                 # Handle TikTok videos

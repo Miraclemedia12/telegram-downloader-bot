@@ -33,6 +33,25 @@ if os.environ.get("YOUTUBE_COOKIES"):
     with open("cookies.txt", "w") as f:
         f.write(os.environ.get("YOUTUBE_COOKIES"))
 
+def add_instagram_session_cookie():
+    """Simple Instagram login: put just the value of your Instagram 'sessionid' cookie in the INSTAGRAM_SESSIONID
+    environment variable. It is added to cookies.txt (next to any cookies already there) for yt-dlp and gallery-dl."""
+    session_id = (os.environ.get("INSTAGRAM_SESSIONID") or "").strip().strip('"').strip("'")
+    if not session_id:
+        return
+    existing = ""
+    if os.path.exists("cookies.txt"):
+        with open("cookies.txt", "r", errors="ignore") as cf:
+            existing = cf.read()
+    if not existing.lstrip().startswith("#"):
+        existing = "# Netscape HTTP Cookie File\n" + existing
+    if not existing.endswith("\n"):
+        existing += "\n"
+    with open("cookies.txt", "w") as cf:
+        cf.write(existing + f".instagram.com\tTRUE\t/\tTRUE\t2000000000\tsessionid\t{session_id}\n")
+
+add_instagram_session_cookie()
+
 # --- KEEP ALIVE WEB SERVER (For 24/7 Cloud Hosting) ---
 app = Flask('')
 

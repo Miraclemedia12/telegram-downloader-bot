@@ -462,14 +462,152 @@ def fetch_twitter_media(url, work_dir):
     return files
 
 
-def fetch_instagram_embed(url, work_dir):
-    """Best-effort without login: reads Instagram's public embed page of the post for its picture links."""
+def _ig_walk(obj):
+    """Yields every dict found anywhere inside a parsed JSON structure."""
+    stack = [obj]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            yield cur
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+
+
+def _ig_node_to_media(node):
+    """One Instagram slide (any of the JSON shapes Instagram uses) -> ('video'|'photo', url) or None."""
+    if not isinstance(node, dict):
+        return None
+    video = None
+    if node.get("is_video") or node.get("video_url") or node.get("video_versions"):
+        video = node.get("video_url")
+        if not video:
+            versions = node.get("video_versions") or []
+            if versions and isinstance(versions[0], dict):
+                video = versions[0].get("url")
+    image = node.get("display_url")
+    if not image:
+        cands = (node.get("image_versions2") or {}).get("candidates") or []
+        if cands and isinstance(cands[0], dict):
+            image = cands[0].get("url")
+    if not image:
+        res = node.get("display_resources") or []
+        if res and isinstance(res[-1], dict):
+            image = res[-1].get("src")
+    if video:
+        return ("video", video)
+    if image:
+        return ("photo", image)
+    return None
+
+
+def parse_instagram_embed_media(page):
+    """Reads the REAL slide list out of Instagram's embed page (the data is JSON hidden inside the page, often
+    escaped twice). Returns [('photo'|'video', url), ...] in slide order, or [] when the page has no such data."""
+    roots = []
+    decoder = json.JSONDecoder()
+
+    # 1) "contextJSON":"{...}"  - a JSON document stored inside a JSON string
+    for m in re.finditer(r'"contextJSON"\s*:\s*"((?:[^"\\]|\\.)*)"', page):
+        try:
+            roots.append(json.loads(json.loads('"' + m.group(1) + '"')))
+        except Exception:
+            pass
+
+    # 2) window.__additionalDataLoaded('extra', {...})
+    for m in re.finditer(r'__additionalDataLoaded\s*\(\s*[^,]+,\s*', page):
+        try:
+            obj, _ = decoder.raw_decode(page[m.end():])
+            roots.append(obj)
+        except Exception:
+            pass
+
+    # 3) a plain "shortcode_media":{...} object anywhere in the page (also after removing one level of escaping)
+    for text in (page, page.replace('\\"', '"').replace('\\/', '/')):
+        for m in re.finditer(r'"(?:xdt_)?shortcode_media"\s*:\s*(?=\{)', text):
+            try:
+                obj, _ = decoder.raw_decode(text[m.end():])
+                roots.append({"shortcode_media": obj})
+            except Exception:
+                pass
+
+    # A carousel lists all its slides in edge_sidecar_to_children (or carousel_media): take the longest list found
+    best = []
+    for root in roots:
+        for node in _ig_walk(root):
+            slides = None
+            edges = node.get("edge_sidecar_to_children")
+            if isinstance(edges, dict):
+                slides = [e.get("node") for e in (edges.get("edges") or []) if isinstance(e, dict)]
+            elif isinstance(node.get("carousel_media"), list):
+                slides = node["carousel_media"]
+            if slides:
+                media = [x for x in (_ig_node_to_media(s) for s in slides) if x]
+                if len(media) > len(best):
+                    best = media
+    if best:
+        return best
+
+    # Not a carousel: a single picture or video
+    for root in roots:
+        for node in _ig_walk(root):
+            for key in ("shortcode_media", "xdt_shortcode_media"):
+                if isinstance(node.get(key), dict):
+                    one = _ig_node_to_media(node[key])
+                    if one:
+                        return [one]
+    return []
+
+
+def scrape_instagram_post_images(page):
+    """Last-resort scan of the raw embed page for post pictures (not profile pictures), without duplicates."""
+    text = page.replace('\\/', '/').replace('\\u0026', '&').replace('&amp;', '&')
+    seen, urls = set(), []
+    for u in re.findall(r'https://[A-Za-z0-9.\-]*(?:cdninstagram\.com|fbcdn\.net)/[^\s"\'<>\\]+', text):
+        key = u.split('?')[0]
+        if '-15/' not in key or key in seen:       # '-15' = post pictures, '-19' = profile pictures
+            continue
+        if not key.lower().endswith(('.jpg', '.jpeg', '.png', '.webp')):
+            continue
+        seen.add(key)
+        urls.append(u)
+    return urls
+
+
+def fetch_instagram_embed(url, work_dir, strict=False):
+    """Best-effort without login: reads Instagram's public embed page of the post and returns ALL its slides
+    (pictures and videos). With strict=True it only accepts the real slide list (never a thumbnail guess)."""
     m = re.search(r'instagram\.com/(?:[^/?#]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)', url, re.I)
     if not m:
         raise Exception("not an Instagram post link")
     r = requests.get(f"https://www.instagram.com/p/{m.group(1)}/embed/captioned/", headers=HEADERS, timeout=30)
     r.raise_for_status()
-    body = r.text.replace('\\"', '"').replace('\\/', '/')
+    page = r.text
+
+    # Step 1: the real slide list hidden in the page (carousel -> every slide, in order)
+    try:
+        media = parse_instagram_embed_media(page)
+    except Exception as e:
+        print(f"[IG-EMBED] could not read the slide data: {e}")
+        media = []
+    print(f"[IG-EMBED] {m.group(1)}: page {len(page)} bytes, contextJSON={'contextJSON' in page}, "
+          f"sidecar={'edge_sidecar_to_children' in page}, slides found={len(media)}")
+    if media:
+        photo_urls = [u for kind, u in media if kind == "photo"]
+        files = download_images(photo_urls, work_dir) if photo_urls else []
+        for idx, (kind, u) in enumerate(media, 1):
+            if kind == "video":
+                try:
+                    files.append(download_video(u, work_dir, idx))
+                except Exception as e:
+                    print(f"[IG-EMBED] video slide {idx} skipped: {e}")
+        if files:
+            return files
+    if strict:
+        raise Exception("embed page had no readable slide list")
+
+    # Step 2 (old behaviour, kept): picture links found by simple text search
+    body = page.replace('\\"', '"').replace('\\/', '/')
 
     found = [u.replace('\\u0026', '&') for u in re.findall(r'"display_url"\s*:\s*"([^"]+)"', body)]
     if not found:
@@ -478,6 +616,13 @@ def fetch_instagram_embed(url, work_dir):
     for u in found:
         if u.startswith("http") and u not in urls:
             urls.append(u)
+
+    # Step 3: if a plain scan of the page sees more post pictures than the search above, use that (more slides)
+    scanned = scrape_instagram_post_images(page)
+    if len(scanned) > len(urls):
+        print(f"[IG-EMBED] page scan found {len(scanned)} pictures instead of {len(urls)}")
+        urls = scanned
+
     files = download_images(urls, work_dir)
     if not files:
         raise Exception("embed page had no pictures")
@@ -536,8 +681,10 @@ def find_fuller_media_set(raw_url, resolved_url, have_files, skip_names=()):
         engines.append(("gallery-dl", lambda d: run_gallery_dl(resolved_url, d)))
         if raw_url != resolved_url:
             engines.append(("gallery-dl (original link)", lambda d: run_gallery_dl(raw_url, d)))
-        if not have_video:             # the embed page only knows picture links, never use it to replace a video
+        if not have_video:
             engines.append(("Instagram embed", lambda d: fetch_instagram_embed(resolved_url, d)))
+        else:                          # first slide is a video: only accept the embed page's real slide list (no thumbnails)
+            engines.append(("Instagram embed", lambda d: fetch_instagram_embed(resolved_url, d, strict=True)))
     else:
         return None, None
 
@@ -579,8 +726,10 @@ def try_photo_engines(chat_id, raw_url, resolved_url):
     if not is_x:
         engines.append(("page preview", lambda d: fetch_page_meta_images(resolved_url, d)))
 
+    tried_engines = []      # engines already used for this link, so the "more slides?" check never repeats them
     with PhotoProgress(chat_id) as progress:
         for name, engine in engines:
+            tried_engines.append(name)
             work_dir = tempfile.mkdtemp(prefix="photos_", dir="downloads")
             fuller_dir = None
             try:
@@ -596,7 +745,7 @@ def try_photo_engines(chat_id, raw_url, resolved_url):
                 fuller_dir = None
                 try:
                     fuller_files, fuller_dir = find_fuller_media_set(resolved_url=resolved_url, raw_url=raw_url,
-                                                                     have_files=files, skip_names=(name,))
+                                                                     have_files=files, skip_names=tuple(tried_engines))
                     if fuller_files:
                         files = fuller_files
                 except Exception as e:

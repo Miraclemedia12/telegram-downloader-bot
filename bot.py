@@ -224,94 +224,115 @@ def handle_download(message):
     if not os.path.exists('downloads'):
         os.makedirs('downloads')
 
-    # --- TIKTOK BULLETPROOF ENGINE (TIKWM + YT-DLP FALLBACK) ---
-    if "tiktok.com" in url or "vt.tiktok.com" in url or "vm.tiktok.com" in url:
+    # --- TIKTOK ENGINE: TIKWM FIRST, YT-DLP VIDEO FALLBACK ONLY ---
+    is_tiktok = any(host in url.lower() or host in raw_url.lower()
+                    for host in ("tiktok.com", "vt.tiktok.com", "vm.tiktok.com"))
+    is_tiktok_photo = bool(re.search(r"tiktok\.com/@[^/]+/photo/", url, re.I) or
+                           re.search(r"tiktok\.com/@[^/]+/photo/", raw_url, re.I))
+
+    if is_tiktok:
         try:
-            bot.send_chat_action(message.chat.id, 'upload_video')
+            bot.send_chat_action(message.chat.id, 'upload_photo' if is_tiktok_photo else 'upload_video')
             api_url = "https://www.tikwm.com/api/"
-            # TikWM's documented/public examples use POST form data. A GET request
-            # can return a response without the slideshow image list.
-            api_response = requests.post(
+            # Keep TikWM's URL-query method, which the original bot used.
+            api_response = requests.get(
                 api_url,
-                data={'url': raw_url, 'hd': 1},
+                params={"url": raw_url, "hd": "1"},
                 headers=HEADERS,
                 timeout=30
             )
             api_response.raise_for_status()
             res = api_response.json()
-            print(f"[TIKWM LOG] code={res.get('code')} msg={res.get('msg')} keys={list(res.keys())}")
+            data = res.get("data") if isinstance(res, dict) else None
+            print(
+                f"[TIKWM LOG] http={api_response.status_code} code={res.get('code') if isinstance(res, dict) else 'invalid-json'} "
+                f"msg={res.get('msg') if isinstance(res, dict) else ''} "
+                f"data_keys={list(data.keys()) if isinstance(data, dict) else []}"
+            )
 
-            if isinstance(res, dict) and res.get("code") == 0 and isinstance(res.get("data"), dict):
-                data = res["data"]
+            if isinstance(data, dict) and res.get("code") == 0:
+                if is_tiktok_photo:
+                    # Photo-mode posts require an image array; yt-dlp does not handle /photo/ links.
+                    image_items = data.get("images")
+                    if not image_items and isinstance(data.get("image_post_info"), dict):
+                        image_items = data["image_post_info"].get("images")
+                    if not image_items and isinstance(data.get("imagePostInfo"), dict):
+                        image_items = data["imagePostInfo"].get("images")
 
-                # TikTok photo-mode posts are not supported by yt-dlp itself.
-                # Providers may expose the image list in different response fields.
-                image_items = data.get('images')
-                if not image_items and isinstance(data.get('image_post_info'), dict):
-                    image_items = data['image_post_info'].get('images')
-                if not image_items and isinstance(data.get('imagePostInfo'), dict):
-                    image_items = data['imagePostInfo'].get('images')
+                    image_urls = []
+                    if isinstance(image_items, list):
+                        for item in image_items:
+                            candidates = []
+                            if isinstance(item, str):
+                                candidates = [item]
+                            elif isinstance(item, dict):
+                                for key in ("url", "url_list", "urlList", "image_url", "display_url", "origin_url"):
+                                    value = item.get(key)
+                                    candidates.extend(value if isinstance(value, list) else [value])
+                            for candidate in candidates:
+                                if isinstance(candidate, str) and candidate.startswith("http") and candidate not in image_urls:
+                                    image_urls.append(candidate)
+                                    break
 
-                image_urls = []
-                if isinstance(image_items, list):
-                    for item in image_items:
-                        if isinstance(item, str) and item.startswith('http'):
-                            image_urls.append(item)
-                        elif isinstance(item, dict):
-                            candidate = (item.get('url') or item.get('url_list') or
-                                         item.get('image_url') or item.get('display_url'))
-                            if isinstance(candidate, list):
-                                candidate = next((x for x in candidate if isinstance(x, str) and x.startswith('http')), None)
-                            if isinstance(candidate, str) and candidate.startswith('http'):
-                                image_urls.append(candidate)
+                    if not image_urls:
+                        print(f"[TIKWM PHOTO ERROR] No image URLs returned. data_keys={list(data.keys())}")
+                        bot.reply_to(
+                            message,
+                            "⚠️ I reached TikTok, but the download provider did not return the slideshow photos. Please try another public photo post. If this keeps happening, the photo provider/API needs changing."
+                        )
+                        return
 
-                if image_urls:
                     for idx, img_url in enumerate(image_urls):
-                        img_path = f"downloads/tt_photo_{message.chat.id}_{idx}.jpg"
+                        img_path = f"downloads/tt_photo_{message.chat.id}_{message.message_id}_{idx}.jpg"
                         try:
                             img_response = requests.get(img_url, headers=HEADERS, timeout=30)
                             img_response.raise_for_status()
+                            if not img_response.content:
+                                raise ValueError("TikTok image response was empty")
                             with open(img_path, "wb") as f:
                                 f.write(img_response.content)
                             with open(img_path, "rb") as photo:
-                                cap = BOT_CAPTION if idx == 0 else None
-                                bot.send_photo(message.chat.id, photo, caption=cap, parse_mode="HTML")
+                                caption = BOT_CAPTION if idx == 0 else None
+                                bot.send_photo(message.chat.id, photo, caption=caption, parse_mode="HTML" if caption else None)
                         finally:
                             if os.path.exists(img_path):
                                 os.remove(img_path)
                     return
 
-                # Don't send photo-mode URLs to yt-dlp: its extractor reports
-                # Unsupported URL for TikTok /photo/ posts.
-                if re.search(r'tiktok\.com/@[^/]+/photo/', url, re.I):
-                    print(f"[TIKWM PHOTO ERROR] No image URLs returned. Response keys: {list(data.keys())}")
-                    bot.reply_to(
-                        message,
-                        "⚠️ I couldn't retrieve the photos from this TikTok post. The download provider did not return its image list. Please try again later or send a TikTok video link."
-                    )
-                    return
-
-                # Handle TikTok videos
+                # Normal TikTok video
                 play_url = data.get("play") or data.get("hdplay")
                 if play_url:
                     video_url = play_url if play_url.startswith("http") else "https://www.tikwm.com" + play_url
-                    video_bytes = requests.get(video_url, headers=HEADERS, timeout=30).content
-                    file_path = "downloads/tiktok_no_watermark.mp4"
-                    
-                    with open(file_path, "wb") as f:
-                        f.write(video_bytes)
-
-                    with open(file_path, "rb") as video:
-                        bot.send_video(message.chat.id, video, caption=BOT_CAPTION, parse_mode="HTML")
-
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
+                    video_response = requests.get(video_url, headers=HEADERS, timeout=60)
+                    video_response.raise_for_status()
+                    if not video_response.content:
+                        raise ValueError("TikWM video response was empty")
+                    file_path = f"downloads/tiktok_{message.chat.id}_{message.message_id}.mp4"
+                    try:
+                        with open(file_path, "wb") as f:
+                            f.write(video_response.content)
+                        with open(file_path, "rb") as video:
+                            bot.send_video(message.chat.id, video, caption=BOT_CAPTION, parse_mode="HTML")
+                    finally:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
                     return
 
+                print("[TIKWM VIDEO ERROR] API returned data without play/hdplay URL")
         except Exception as err:
-            print("TikWM API error, switching to yt-dlp TikTok fallback:", err)
+            print(f"[TIKWM ERROR] {type(err).__name__}: {err}")
+            if is_tiktok_photo:
+                bot.reply_to(
+                    message,
+                    "⚠️ I couldn't fetch this TikTok photo post from the download provider. Please try again later or send another public photo link."
+                )
+                return
 
-        # Bulletproof fallback for TikTok videos using yt-dlp if TikWM fails
+        # Never pass photo-mode links to yt-dlp; it reports /photo/ URLs as unsupported.
+        if is_tiktok_photo:
+            return
+
+        # Video-only fallback using yt-dlp if TikWM fails
         try:
             bot.send_chat_action(message.chat.id, 'upload_video')
             ydl_opts = {
@@ -329,11 +350,12 @@ def handle_download(message):
                 info = ydl.extract_info(raw_url, download=True)
                 filename = ydl.prepare_filename(info)
 
-            with open(filename, 'rb') as video:
-                bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
-
-            if os.path.exists(filename):
-                os.remove(filename)
+            try:
+                with open(filename, 'rb') as video:
+                    bot.send_video(message.chat.id, video, caption=BOT_CAPTION)
+            finally:
+                if os.path.exists(filename):
+                    os.remove(filename)
             return
         except Exception as ydl_err:
             print("TikTok yt-dlp fallback error:", ydl_err)

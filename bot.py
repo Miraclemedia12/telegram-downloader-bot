@@ -513,6 +513,53 @@ def fetch_page_meta_images(url, work_dir):
     return files
 
 
+def find_fuller_media_set(raw_url, resolved_url, have_files, skip_names=()):
+    """MULTI-SLIDE FIX: an engine can 'succeed' while returning only part of a post (typically yt-dlp giving just
+    the FIRST slide of an Instagram carousel, or only the video of a tweet that also has photos). This asks the
+    other engines whether the post really holds MORE pictures/videos than `have_files`.
+    Returns (files, work_dir) when a fuller set was found (caller must delete work_dir after sending),
+    otherwise (None, None). Nothing is ever sent from here."""
+    low = resolved_url.lower()
+    is_x = "twitter.com" in low or "x.com" in low
+    is_instagram = "instagram.com" in low or "instagr.am" in low
+    have_count = len(have_files)
+    have_video = any(not str(p).lower().endswith(PHOTO_EXTS) for p in have_files)
+
+    engines = []
+    if is_x:
+        engines.append(("FxTwitter", lambda d: fetch_twitter_media(resolved_url, d)))
+    elif is_instagram:
+        if re.search(r'/(?:reel|reels|tv)/', low):
+            return None, None          # reels are always a single video, nothing to look for
+        if have_count > 1:
+            return None, None          # already got several slides
+        engines.append(("gallery-dl", lambda d: run_gallery_dl(resolved_url, d)))
+        if raw_url != resolved_url:
+            engines.append(("gallery-dl (original link)", lambda d: run_gallery_dl(raw_url, d)))
+        if not have_video:             # the embed page only knows picture links, never use it to replace a video
+            engines.append(("Instagram embed", lambda d: fetch_instagram_embed(resolved_url, d)))
+    else:
+        return None, None
+
+    os.makedirs("downloads", exist_ok=True)
+    skip_gallery = any(str(n).startswith("gallery-dl") for n in skip_names)
+    for name, engine in engines:
+        if name in skip_names or (skip_gallery and name.startswith("gallery-dl")):
+            continue
+        work_dir = tempfile.mkdtemp(prefix="more_", dir="downloads")
+        try:
+            files = engine(work_dir)
+        except Exception as e:
+            print(f"[MULTI-SLIDE] {name} could not add more for {resolved_url}: {e}")
+            shutil.rmtree(work_dir, ignore_errors=True)
+            continue
+        if files and len(files) > have_count:
+            print(f"[MULTI-SLIDE] {name} found {len(files)} item(s) instead of {have_count}")
+            return files, work_dir
+        shutil.rmtree(work_dir, ignore_errors=True)
+    return None, None
+
+
 def try_photo_engines(chat_id, raw_url, resolved_url):
     """Photo-post fallbacks, used when yt-dlp could not handle the link (yt-dlp has no support for TikTok photo
     posts, Facebook photos or Instagram image posts). Returns True if something was sent to the user."""
@@ -535,6 +582,7 @@ def try_photo_engines(chat_id, raw_url, resolved_url):
     with PhotoProgress(chat_id) as progress:
         for name, engine in engines:
             work_dir = tempfile.mkdtemp(prefix="photos_", dir="downloads")
+            fuller_dir = None
             try:
                 try:
                     files = engine(work_dir)
@@ -543,6 +591,16 @@ def try_photo_engines(chat_id, raw_url, resolved_url):
                     continue
                 if not files:
                     continue
+
+                # MULTI-SLIDE FIX: this engine may have found only the first slide - check the others for more.
+                fuller_dir = None
+                try:
+                    fuller_files, fuller_dir = find_fuller_media_set(resolved_url=resolved_url, raw_url=raw_url,
+                                                                     have_files=files, skip_names=(name,))
+                    if fuller_files:
+                        files = fuller_files
+                except Exception as e:
+                    print(f"[MULTI-SLIDE] check failed: {e}")
 
                 photo_count = len([p for p in files if p.lower().endswith(PHOTO_EXTS)])
                 if photo_count:
@@ -559,6 +617,8 @@ def try_photo_engines(chat_id, raw_url, resolved_url):
                 return True
             finally:
                 shutil.rmtree(work_dir, ignore_errors=True)
+                if fuller_dir:
+                    shutil.rmtree(fuller_dir, ignore_errors=True)
     return False
 
 # --- COMMAND HANDLERS ---
@@ -835,6 +895,7 @@ def handle_download(message):
 
     download_done = False      # becomes True once yt-dlp really has the file(s), so a later Telegram error is not mistaken for a bad link
     downloaded_files = []
+    fuller_dir = None          # temp folder of the "all slides" set (see find_fuller_media_set), removed after sending
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(raw_url, download=True)
@@ -856,6 +917,19 @@ def handle_download(message):
             if not downloaded_files:
                 raise Exception("No media files found after download.")
 
+            # MULTI-SLIDE FIX: yt-dlp often returns only the FIRST slide of an Instagram carousel (or only the video of
+            # a tweet that also has photos). Ask the other engines whether the post has more, and send the fullest set.
+            try:
+                with PhotoProgress(message.chat.id, 'upload_photo'):
+                    fuller_files, fuller_dir = find_fuller_media_set(raw_url, resolved_url, downloaded_files)
+                if fuller_files:
+                    for f_path in downloaded_files:
+                        if os.path.exists(f_path):
+                            os.remove(f_path)
+                    downloaded_files = fuller_files
+            except Exception as multi_err:
+                print(f"[MULTI-SLIDE] check failed, sending what yt-dlp found: {multi_err}")
+
             download_done = True
 
             # Pictures go out as albums of up to 10 (any number of pictures works), videos one by one
@@ -871,6 +945,8 @@ def handle_download(message):
             for f_path in downloaded_files:
                 if os.path.exists(f_path):
                     os.remove(f_path)
+            if fuller_dir:
+                shutil.rmtree(fuller_dir, ignore_errors=True)
 
     except Exception as e:
         print(f"[SERVER LOG] Download failed for {raw_url}: {str(e)}")
@@ -879,6 +955,8 @@ def handle_download(message):
         for f_path in downloaded_files:
             if os.path.exists(f_path):
                 os.remove(f_path)
+        if fuller_dir:
+            shutil.rmtree(fuller_dir, ignore_errors=True)
 
         if download_done:
             # The download worked but Telegram refused the upload (for example the file is too big).

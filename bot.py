@@ -14,6 +14,13 @@ from concurrent.futures import ThreadPoolExecutor
 from flask import Flask
 from threading import Thread, Event
 
+# Show print() output in Render's logs immediately (otherwise Python holds it back and only errors appear).
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except Exception:
+    pass
+
 # Pillow is optional: it is only used to make sure every picture is in a format/size Telegram accepts.
 try:
     from PIL import Image
@@ -833,6 +840,61 @@ def broadcast_message(message):
         f"• Failed/Blocked: <b>{fail_count}</b>",
         parse_mode="HTML"
     )
+
+# --- ADMIN INSTAGRAM TEST COMMAND ---
+@bot.message_handler(commands=['igtest'])
+def instagram_test(message):
+    """Admin only: /igtest <instagram link> - reports what Instagram gives this server for that post."""
+    if str(message.from_user.id) != str(ADMIN_ID):
+        bot.reply_to(message, "⛔ You are not authorized to use this admin command!")
+        return
+    parts = message.text.split(maxsplit=1)
+    link = re.search(r'https?://\S+', parts[1]) if len(parts) > 1 else None
+    if not link:
+        bot.reply_to(message, "Usage: /igtest https://www.instagram.com/p/XXXXXXXX/")
+        return
+    raw_link = link.group(0).rstrip('.,;)]}>"\'')
+    bot.reply_to(message, "🔎 Testing, this can take up to 2 minutes...")
+    lines = []
+    try:
+        resolved = unshorten_url(raw_link)
+        if os.path.exists("cookies.txt"):
+            with open("cookies.txt", "r", errors="ignore") as cf:
+                cookie_text = cf.read()
+            lines.append(f"cookies.txt: found, has Instagram cookies: {'instagram.com' in cookie_text}")
+        else:
+            lines.append("cookies.txt: NOT found (YOUTUBE_COOKIES variable is empty or missing)")
+
+        code = re.search(r'instagram\.com/(?:[^/?#]+/)?(?:p|reel|reels|tv)/([A-Za-z0-9_-]+)', resolved, re.I)
+        if not code:
+            lines.append("Not an Instagram post link.")
+        else:
+            try:
+                r = requests.get(f"https://www.instagram.com/p/{code.group(1)}/embed/captioned/", headers=HEADERS, timeout=30)
+                page = r.text
+                media = parse_instagram_embed_media(page)
+                lines.append(f"Embed page: HTTP {r.status_code}, {len(page)} bytes")
+                lines.append(f"  contextJSON={'contextJSON' in page}, sidecar={'edge_sidecar_to_children' in page}, "
+                             f"additionalData={'__additionalDataLoaded' in page}, picture tags={page.count('EmbeddedMediaImage')}")
+                lines.append(f"  login wall words: {'login' in page.lower()}")
+                lines.append(f"  slides read from page: {len(media)} "
+                             f"({len([1 for k, _ in media if k == 'photo'])} photos, {len([1 for k, _ in media if k == 'video'])} videos)")
+                lines.append(f"  post pictures seen by page scan: {len(scrape_instagram_post_images(page))}")
+            except Exception as e:
+                lines.append(f"Embed page failed: {str(e)[:300]}")
+
+        os.makedirs("downloads", exist_ok=True)
+        work_dir = tempfile.mkdtemp(prefix="igtest_", dir="downloads")
+        try:
+            files = run_gallery_dl(resolved, work_dir)
+            lines.append(f"gallery-dl: {len(files)} file(s) found")
+        except Exception as e:
+            lines.append(f"gallery-dl: {str(e)[:500]}")
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+    except Exception as e:
+        lines.append(f"Test crashed: {e}")
+    bot.send_message(message.chat.id, "\n".join(lines))
 
 # --- MEDIA DOWNLOAD HANDLER ---
 @bot.message_handler(func=lambda message: True)
